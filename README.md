@@ -1,82 +1,133 @@
-# Gost IP6 Script
+<div align="center">
+
+# Gost IP6 Script — Optimized Fork
 
 [English](README.md) | [فارسی](README-Fa.md)
 
-**Description:**
+An interactive Bash installer/manager for **Gost** tunnels (IPv4 / IPv6), with automatic
+server optimization and a self-healing watchdog.
 
-This Bash script simplifies the configuration of Gost tunnels with options for both IP4 and IP6 setups. The script presents an interactive menu for user-friendly execution.
-
-
-**Prerequisites:**
-
-- Ensure you have root privileges before running the script.
-
-**Tested Environment:**
-
-- Ubuntu 20.04 , Ubuntu 22.04
-
-**Installation:**
-
-![Screenshot-gost](https://raw.githubusercontent.com/masoudgb/Gost-ip6/955933ccb4111291b2cc343a3f55e1fe05c83864/image/Screenshot_20240430_113105.jpg).
-
-
-
-Clone the repository:
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/masoudgb/Gost-ip6/main/install.sh)
-   ```
-
-Custom Version: 
-
-```bash
-bash <(curl -Ls https://github.com/masoudgb/Gost-ip6/raw/v2.1.7/Gost.sh)
-   ```
-
-Follow the on-screen prompts to configure Gost tunnels according to your preferences.
-
-
-## Project Tutorial
-
-[![YouTube Tutorial](https://img.youtube.com/vi/LJYVWH8GyKM/0.jpg)](https://youtu.be/LJYVWH8GyKM)
+</div>
 
 ---
 
-[![YouTube Tutorial](https://img.youtube.com/vi/Qlz61mlkQ5A/0.jpg)](https://youtu.be/Qlz61mlkQ5A)
+## Install
 
+Run as **root** on your server:
 
-**Options:**
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh)
+```
 
-The script offers the following options:
+The script self-installs to `/etc/gost/install.sh`, so afterwards you can just type:
 
-- Gost Tunnel By IP4
-- Gost Tunnel By IP6
-- Gost Status
-- Update Script 
-- Add New IP
-- Change Gost Version
-- Auto Restart Gost
-- Auto Clear Cashe
-- Install BBR
-- Uninstall
-- Exit
+```bash
+gost
+```
 
+to open the menu again.
 
-**Important Notes for Configuration:**
+> Requirements: root access, `bash`, and a Debian/Ubuntu-like system (tested on Ubuntu 20.04 / 22.04 / 24.04 / 26.04).
 
-- Run Script Again By "gost" Command
-- Avoid using duplicate ports.
-- Choose port ranges between 54 and 65000 for optimal configuration.
-- Your suggestions for script improvement and enhancement are highly welcomed. Feel free to share your ideas on the [GitHub repository](https://github.com/masoudgb/Gost-ip6/issues).
+---
 
+## What this fork adds
 
-**Credits:**
+This is a fork of [masoudgb/Gost-ip6](https://github.com/masoudgb/Gost-ip6) (v2.2.0)
+with production hardening and quality-of-life improvements:
 
-- Created By Masoud Gb
-- Special Thanks to Hamid Router
+### 1. Automatic swap
+Before installing, a swap file is created sized to the server's RAM and free disk
+(e.g. ~2 GB swap on a 2 GB RAM server). This prevents the kernel OOM-killer from
+killing the tunnel under load. `vm.swappiness` is set to `10` (safety net, not active swapping).
+
+### 2. Kernel / network tuning
+Written to `/etc/sysctl.d/99-gost-tuning.conf` and applied persistently:
+- `nf_conntrack_max = 262144` and shorter established timeout
+- `somaxconn`, `tcp_max_syn_backlog`, `netdev_max_backlog`
+- `tcp_tw_reuse`, `tcp_fin_timeout`, `tcp_slow_start_after_idle`
+- larger `rmem`/`wmem` buffers, higher `fs.file-max`, `swappiness=10`
+
+### 3. Journald size cap
+`SystemMaxUse=200M` so gost's per-connection logging can't fill the disk
+(the original setup could grow journals past 1 GB).
+
+### 4. Hardened systemd units
+Each `gost_*.service` is generated with:
+```
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+OOMScoreAdjust=-1000
+LimitNOFILE=1048576
+TasksMax=infinity
+After=network-online.target
+```
+So if gost crashes or is OOM-killed it comes back automatically, and it is
+protected from being chosen by the OOM-killer.
+
+### 5. Auto-Heal Watchdog
+A systemd timer runs a health check every 60 seconds and escalates:
+1. **Restart** the tunnel (up to 3 attempts).
+2. Still down? **Reboot the server once**.
+3. Still down after the reboot? **Do nothing further** (the problem is probably
+   elsewhere — no reboot loop).
+
+State is persisted, so it never reboots more than once per failure, and it resets
+automatically once the tunnel is healthy again. Health = all units active + a TCP
+probe to the listening port.
+
+### 6. Fast-DNS assisted download
+Downloading from GitHub on an Iranian server is often slow. Every GitHub download
+now: tries the default DNS first, and if it is too slow/fails, automatically
+switches through a list of fast resolvers (Shecan, Radar, Cloudflare/Google,
+Quad9, AliDNS), then **always restores the server's original DNS** afterwards.
+
+### 7. No version prompt
+The tunnel install always uses the **official Gost 2.11.5** — it no longer asks
+"official or latest".
+
+---
+
+## Menu options
+
+| # | Option |
+|---|--------|
+| 1 | Gost Tunnel By IP4 |
+| 2 | Gost Tunnel By IP6 |
+| 3 | Gost Status |
+| 4 | Update Script |
+| 5 | Add New IP |
+| 6 | Change Gost Version (manual) |
+| 7 | Auto Restart Gost |
+| 8 | Auto Clear Cache |
+| 9 | Install BBR |
+| 10 | Uninstall |
+| 11 | Apply Optimizations (Swap + Tuning) |
+| 12 | Install Auto-Heal Watchdog |
+| 13 | Remove Auto-Heal Watchdog |
+| 14 | Exit |
+
+When you install a tunnel (options 1 or 2), the optimizations and the watchdog are
+installed automatically.
+
+---
+
+## Configuration notes
+
+- Protocol choices: `tcp`, `udp`, `grpc`.
+- Port range must be between `54` and `65000`; avoid duplicate ports.
+- Re-open the menu any time with the `gost` command.
+
+---
+
+## Credits
+
+- Original script: **Masoud Gb** — special thanks to **Hamid Router**
+- Optimized fork: **Aknuun**
+
+Original repository: https://github.com/masoudgb/Gost-ip6
 
 ## Version
 
-Gost IP6 Script v2.2.0
-
----
+`v2.3.0-opt`
