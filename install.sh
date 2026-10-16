@@ -7,87 +7,18 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 #####################################################################
-# Fast-DNS assisted download (for slow GitHub downloads from Iran)
+# Download helper (never touches /etc/resolv.conf)
 #####################################################################
-RESOLV=/etc/resolv.conf
-DNS_STATE=""
 
-# Ready-to-use fast resolvers (Iran-friendly first)
-DNS_CANDIDATES=(
-    "178.22.122.100 185.51.200.2"
-    "10.202.10.202 10.202.10.102"
-    "1.1.1.1 8.8.8.8"
-    "8.8.4.4 9.9.9.9"
-    "223.5.5.5 223.6.6.6"
-)
-
-dns_backup() {
-    [ -n "$DNS_STATE" ] && return 0
-    DNS_STATE=$(mktemp)
-    if [ -L "$RESOLV" ]; then
-        printf 'SYMLINK %s\n' "$(readlink "$RESOLV")" > "$DNS_STATE"
-    else
-        printf 'FILE\n' > "$DNS_STATE"
-        cat "$RESOLV" >> "$DNS_STATE" 2>/dev/null
-    fi
-}
-
-dns_apply() {
-    local servers="$1" s
-    dns_backup
-    rm -f "$RESOLV"
-    {
-        echo "# Temporary resolv.conf set by Gost installer"
-        for s in $servers; do echo "nameserver $s"; done
-    } > "$RESOLV"
-}
-
-dns_restore() {
-    [ -z "$DNS_STATE" ] && return 0
-    [ -f "$DNS_STATE" ] || return 0
-    local first
-    first=$(head -n1 "$DNS_STATE")
-    if [ "$first" = "FILE" ]; then
-        tail -n +2 "$DNS_STATE" > "$RESOLV"
-    elif [ "${first#SYMLINK }" != "$first" ]; then
-        rm -f "$RESOLV"
-        ln -sf "${first#SYMLINK }" "$RESOLV"
-    fi
-    rm -f "$DNS_STATE"; DNS_STATE=""
-    flush_dns
-}
-
-flush_dns() {
-    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1
-    command -v systemd-resolve >/dev/null 2>&1 && systemd-resolve --flush-caches >/dev/null 2>&1
-    command -v nscd >/dev/null 2>&1 && nscd -i hosts >/dev/null 2>&1
-    return 0
-}
-
-# Download $1 -> $2. If the default DNS is too slow/fails, retry over fast DNS,
-# then always restore the original DNS on the server.
+# Download $1 -> $2. Tries wget first, then curl with an IPv4 fallback.
 smart_download() {
-    local url="$1" out="$2" deadline="${3:-30}" set
-    if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
+    local url="$1" out="$2" deadline="${3:-30}"
+    if timeout "$deadline" wget -q --tries=2 --timeout=15 -O "$out" "$url" 2>/dev/null; then
         return 0
     fi
-    echo $'\e[33mDownload is slow/failed. Trying alternate (fast) DNS...\e[0m'
-    for set in "${DNS_CANDIDATES[@]}"; do
-        dns_apply "$set"
-        flush_dns
-        echo $'\e[36mTrying DNS: '"$set"$'\e[0m'
-        if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
-            echo $'\e[32mDownloaded successfully.\e[0m'
-            dns_restore
-            return 0
-        fi
-    done
-    dns_restore
+    curl -fsSL --ipv4 --connect-timeout 10 --max-time "$deadline" "$url" -o "$out" 2>/dev/null && return 0
     return 1
 }
-
-# Always put the default DNS back on the server when we exit
-trap dns_restore EXIT
 
 # If launched via process substitution (bash <(curl ...)), install self to disk
 # so that the interactive menu can re-invoke itself reliably.
