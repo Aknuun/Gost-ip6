@@ -6,14 +6,95 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+#####################################################################
+# Fast-DNS assisted download (for slow GitHub downloads from Iran)
+#####################################################################
+RESOLV=/etc/resolv.conf
+DNS_STATE=""
+
+# Ready-to-use fast resolvers (Iran-friendly first)
+DNS_CANDIDATES=(
+    "178.22.122.100 185.51.200.2"
+    "10.202.10.202 10.202.10.102"
+    "1.1.1.1 8.8.8.8"
+    "8.8.4.4 9.9.9.9"
+    "223.5.5.5 223.6.6.6"
+)
+
+dns_backup() {
+    [ -n "$DNS_STATE" ] && return 0
+    DNS_STATE=$(mktemp)
+    if [ -L "$RESOLV" ]; then
+        printf 'SYMLINK %s\n' "$(readlink "$RESOLV")" > "$DNS_STATE"
+    else
+        printf 'FILE\n' > "$DNS_STATE"
+        cat "$RESOLV" >> "$DNS_STATE" 2>/dev/null
+    fi
+}
+
+dns_apply() {
+    local servers="$1" s
+    dns_backup
+    rm -f "$RESOLV"
+    {
+        echo "# Temporary resolv.conf set by Gost installer"
+        for s in $servers; do echo "nameserver $s"; done
+    } > "$RESOLV"
+}
+
+dns_restore() {
+    [ -z "$DNS_STATE" ] && return 0
+    [ -f "$DNS_STATE" ] || return 0
+    local first
+    first=$(head -n1 "$DNS_STATE")
+    if [ "$first" = "FILE" ]; then
+        tail -n +2 "$DNS_STATE" > "$RESOLV"
+    elif [ "${first#SYMLINK }" != "$first" ]; then
+        rm -f "$RESOLV"
+        ln -sf "${first#SYMLINK }" "$RESOLV"
+    fi
+    rm -f "$DNS_STATE"; DNS_STATE=""
+    flush_dns
+}
+
+flush_dns() {
+    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1
+    command -v systemd-resolve >/dev/null 2>&1 && systemd-resolve --flush-caches >/dev/null 2>&1
+    command -v nscd >/dev/null 2>&1 && nscd -i hosts >/dev/null 2>&1
+    return 0
+}
+
+# Download $1 -> $2. If the default DNS is too slow/fails, retry over fast DNS,
+# then always restore the original DNS on the server.
+smart_download() {
+    local url="$1" out="$2" deadline="${3:-30}" set
+    if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
+        return 0
+    fi
+    echo $'\e[33mDownload is slow/failed. Trying alternate (fast) DNS...\e[0m'
+    for set in "${DNS_CANDIDATES[@]}"; do
+        dns_apply "$set"
+        flush_dns
+        echo $'\e[36mTrying DNS: '"$set"$'\e[0m'
+        if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
+            echo $'\e[32mDownloaded successfully.\e[0m'
+            dns_restore
+            return 0
+        fi
+    done
+    dns_restore
+    return 1
+}
+
+# Always put the default DNS back on the server when we exit
+trap dns_restore EXIT
+
 # If launched via process substitution (bash <(curl ...)), install self to disk
 # so that the interactive menu can re-invoke itself reliably.
 if [ ! -f "$0" ]; then
     mkdir -p /etc/gost
-    if command -v curl >/dev/null 2>&1; then
-        curl -Ls https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh -o /etc/gost/install.sh
-    else
-        wget -qO /etc/gost/install.sh https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh
+    if ! smart_download "https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh" /etc/gost/install.sh 25; then
+        curl -Ls https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh -o /etc/gost/install.sh 2>/dev/null
     fi
     chmod +x /etc/gost/install.sh
     exec bash /etc/gost/install.sh
@@ -383,38 +464,16 @@ systemctl enable sysctl-custom
         echo $'\e[32mSymbolic link created: /usr/local/bin/gost\e[0m'
     echo $'\e[32mSystem update completed.\e[0m'
 
-    echo $'\e[32mChoose Gost version:\e[0m'
-    echo $'\e[36m1. \e[0mGost version 2.11.5 (official)'
-    echo $'\e[36m2. \e[0mGost version 3.0.0 (latest)'
-
-    read -p $'\e[97mYour choice: \e[0m' gost_version_choice
-
-if [ "$gost_version_choice" -eq 1 ]; then
-    echo $'\e[32mInstalling Gost version 2.11.5, please wait...\e[0m' && \
-    wget https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz && \
-    echo $'\e[32mGost downloaded successfully.\e[0m' && \
-    gunzip gost-linux-amd64-2.11.5.gz && \
-    mv gost-linux-amd64-2.11.5 /usr/local/bin/gost && \
-    chmod +x /usr/local/bin/gost && \
-    echo $'\e[32mGost installed successfully.\e[0m'
-else
-    if [ "$gost_version_choice" -eq 2 ]; then
-        echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
-        download_url="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz"
-        echo $'\e[32mDownloading Gost 3.0.0...\e[0m'
-        wget -O /tmp/gost.tar.gz "$download_url"
-        if [ ! -s /tmp/gost.tar.gz ]; then
-            echo $'\e[31mError: Download failed or file empty.\e[0m'
-            exit 1
-        fi
-        tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/
+    echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
+    if smart_download "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+        gunzip -f /tmp/gost-2.11.5.gz
+        mv /tmp/gost-2.11.5 /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
-        echo $'\e[32mGost 3.0.0 installed successfully.\e[0m'
+        echo $'\e[32mGost installed successfully.\e[0m'
     else
-        echo $'\e[31mInvalid choice. Exiting...\e[0m'
-        exit
+        echo $'\e[31mError: Download failed. Check the server connectivity.\e[0m'
+        exit 1
     fi
-fi
 
     IFS=',' read -ra port_array <<< "$ports"
     port_count=${#port_array[@]}
@@ -478,7 +537,7 @@ elif [ "$choice" -eq 4 ]; then
     if [ "$update_choice" == "y" ]; then
         echo $'\e[32mUpdating Gost script, please wait...\e[0m'
         mkdir -p /etc/gost
-        wget -O /etc/gost/install.sh https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh
+        smart_download "https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh" /etc/gost/install.sh 25
         chmod +x /etc/gost/install.sh
         echo $'\e[32mUpdate completed.\e[0m'
     else
@@ -536,15 +595,19 @@ elif [ "$choice" -eq 6 ]; then
 
     case "$gost_version_choice" in
         1)
-            echo $'\e[32mInstalling Gost version 2.11.5, please wait...\e[0m' && \
-            wget https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz && \
-            gunzip gost-linux-amd64-2.11.5.gz && \
-            mv gost-linux-amd64-2.11.5 /usr/local/bin/gost && \
-            chmod +x /usr/local/bin/gost && \
-            echo $'\e[32mGost installed successfully.\e[0m'
+            echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
+            if smart_download "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+                gunzip -f /tmp/gost-2.11.5.gz
+                mv /tmp/gost-2.11.5 /usr/local/bin/gost
+                chmod +x /usr/local/bin/gost
+                echo $'\e[32mGost installed successfully.\e[0m'
+            else
+                echo $'\e[31mError: Download failed. Check the server connectivity.\e[0m'
+                exit 1
+            fi
             ;;
         2)
-            echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m' && \
+            echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
             download_url=$(curl -s https://api.github.com/repos/go-gost/gost/releases | \
                            grep -oP '"browser_download_url": "\K(.*?linux.*?\.tar\.gz)(?=")' | \
                            grep -E 'v3\.' | head -n 1)
@@ -552,14 +615,14 @@ elif [ "$choice" -eq 6 ]; then
                 echo $'\e[31mError: Could not find the download URL for the latest 3.x Gost version.\e[0m'
                 exit 1
             fi
-            wget -O /tmp/gost.tar.gz "$download_url"
-            if [ ! -s /tmp/gost.tar.gz ]; then
+            if smart_download "$download_url" /tmp/gost.tar.gz 40; then
+                tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
+                chmod +x /usr/local/bin/gost && \
+                echo $'\e[32mGost 3.x installed successfully.\e[0m'
+            else
                 echo $'\e[31mError: Download failed or file empty.\e[0m'
                 exit 1
             fi
-            tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
-            chmod +x /usr/local/bin/gost && \
-            echo $'\e[32mGost 3.x installed successfully.\e[0m'
             ;;
         *)
             echo $'\e[31mInvalid choice. Exiting...\e[0m'
@@ -630,10 +693,13 @@ elif [ "$choice" -eq 8 ]; then
 
 # If option 9 is selected
 elif [ "$choice" -eq 9 ]; then
-    echo $'\e[32mInstalling BBR, please wait...\e[0m' && \
-    wget -N --no-check-certificate https://github.com/teddysun/across/raw/master/bbr.sh && \
-    chmod +x bbr.sh && \
-    bash bbr.sh
+    echo $'\e[32mInstalling BBR, please wait...\e[0m'
+    if smart_download "https://github.com/teddysun/across/raw/master/bbr.sh" /tmp/bbr.sh 30; then
+        chmod +x /tmp/bbr.sh
+        bash /tmp/bbr.sh
+    else
+        echo $'\e[31mError: Could not download BBR script.\e[0m'
+    fi
     bash "$0"
 
 # If option 10 is selected
