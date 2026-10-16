@@ -6,6 +6,19 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# If launched via process substitution (bash <(curl ...)), install self to disk
+# so that the interactive menu can re-invoke itself reliably.
+if [ ! -f "$0" ]; then
+    mkdir -p /etc/gost
+    if command -v curl >/dev/null 2>&1; then
+        curl -Ls https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh -o /etc/gost/install.sh
+    else
+        wget -qO /etc/gost/install.sh https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh
+    fi
+    chmod +x /etc/gost/install.sh
+    exec bash /etc/gost/install.sh
+fi
+
 # Global paths
 WATCHDOG_BIN=/usr/local/bin/gost-watchdog.sh
 WATCHDOG_SVC=/etc/systemd/system/gost-watchdog.service
