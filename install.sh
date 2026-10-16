@@ -9,14 +9,52 @@ fi
 #####################################################################
 # Download helper (never touches /etc/resolv.conf)
 #####################################################################
+# jsDelivr CDN is used first: it is fast and reachable from Iran even when
+# GitHub release assets are throttled/slow. raw.githubusercontent.com is the
+# fallback.
+SELF_CDN="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main"
+SELF_RAW="https://raw.githubusercontent.com/Aknuun/Gost-ip6/main"
+
+GOST2_URLS=(
+    "$SELF_CDN/gost/gost_2.11.5.gz"
+    "$SELF_RAW/gost/gost_2.11.5.gz"
+)
+GOST3_URLS=(
+    "$SELF_CDN/gost/gost_3.0.0.tar.gz"
+    "$SELF_RAW/gost/gost_3.0.0.tar.gz"
+)
+SELF_URLS=(
+    "$SELF_CDN/install.sh"
+    "$SELF_RAW/install.sh"
+)
 
 # Download $1 -> $2. Tries wget first, then curl with an IPv4 fallback.
 smart_download() {
-    local url="$1" out="$2" deadline="${3:-30}"
-    if timeout "$deadline" wget -q --tries=2 --timeout=15 -O "$out" "$url" 2>/dev/null; then
+    local url="$1" out="$2" deadline="${3:-180}"
+    rm -f "$out"
+    if timeout "$deadline" wget -q --tries=2 --timeout=20 --read-timeout=30 -O "$out" "$url" 2>/dev/null && [ -s "$out" ]; then
         return 0
     fi
-    curl -fsSL --ipv4 --connect-timeout 10 --max-time "$deadline" "$url" -o "$out" 2>/dev/null && return 0
+    rm -f "$out"
+    if curl -fsSL --ipv4 --connect-timeout 15 --max-time "$deadline" "$url" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+        return 0
+    fi
+    rm -f "$out"
+    return 1
+}
+
+# Try every URL in order (last argument is the output path). Returns 0 as soon
+# as one mirror succeeds.
+smart_fetch() {
+    local out="${!#}"
+    local urls=("${@:1:$#-1}")
+    local url
+    for url in "${urls[@]}"; do
+        if smart_download "$url" "$out" 180; then
+            return 0
+        fi
+        echo $'\e[33mMirror failed: '"$url"$'\e[0m'
+    done
     return 1
 }
 
@@ -24,9 +62,7 @@ smart_download() {
 # so that the interactive menu can re-invoke itself reliably.
 if [ ! -f "$0" ]; then
     mkdir -p /etc/gost
-    if ! smart_download "https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh" /etc/gost/install.sh 25; then
-        curl -Ls https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh -o /etc/gost/install.sh 2>/dev/null
-    fi
+    smart_fetch "${SELF_URLS[@]}" /etc/gost/install.sh || true
     chmod +x /etc/gost/install.sh
     exec bash /etc/gost/install.sh
 fi
@@ -396,7 +432,7 @@ systemctl enable sysctl-custom
     echo $'\e[32mSystem update completed.\e[0m'
 
     echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-    if smart_download "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+    if smart_fetch "${GOST2_URLS[@]}" /tmp/gost-2.11.5.gz; then
         gunzip -f /tmp/gost-2.11.5.gz
         mv /tmp/gost-2.11.5 /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
@@ -468,7 +504,7 @@ elif [ "$choice" -eq 4 ]; then
     if [ "$update_choice" == "y" ]; then
         echo $'\e[32mUpdating Gost script, please wait...\e[0m'
         mkdir -p /etc/gost
-        smart_download "https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh" /etc/gost/install.sh 25
+        smart_fetch "${SELF_URLS[@]}" /etc/gost/install.sh
         chmod +x /etc/gost/install.sh
         echo $'\e[32mUpdate completed.\e[0m'
     else
@@ -527,7 +563,7 @@ elif [ "$choice" -eq 6 ]; then
     case "$gost_version_choice" in
         1)
             echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-            if smart_download "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+            if smart_fetch "${GOST2_URLS[@]}" /tmp/gost-2.11.5.gz; then
                 gunzip -f /tmp/gost-2.11.5.gz
                 mv /tmp/gost-2.11.5 /usr/local/bin/gost
                 chmod +x /usr/local/bin/gost
@@ -538,15 +574,8 @@ elif [ "$choice" -eq 6 ]; then
             fi
             ;;
         2)
-            echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
-            download_url=$(curl -s https://api.github.com/repos/go-gost/gost/releases | \
-                           grep -oP '"browser_download_url": "\K(.*?linux.*?\.tar\.gz)(?=")' | \
-                           grep -E 'v3\.' | head -n 1)
-            if [ -z "$download_url" ]; then
-                echo $'\e[31mError: Could not find the download URL for the latest 3.x Gost version.\e[0m'
-                exit 1
-            fi
-            if smart_download "$download_url" /tmp/gost.tar.gz 40; then
+            echo $'\e[32mInstalling Gost version 3.x, please wait...\e[0m'
+            if smart_fetch "${GOST3_URLS[@]}" /tmp/gost.tar.gz; then
                 tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
                 chmod +x /usr/local/bin/gost && \
                 echo $'\e[32mGost 3.x installed successfully.\e[0m'
@@ -625,7 +654,7 @@ elif [ "$choice" -eq 8 ]; then
 # If option 9 is selected
 elif [ "$choice" -eq 9 ]; then
     echo $'\e[32mInstalling BBR, please wait...\e[0m'
-    if smart_download "https://github.com/teddysun/across/raw/master/bbr.sh" /tmp/bbr.sh 30; then
+    if smart_download "https://github.com/teddysun/across/raw/master/bbr.sh" /tmp/bbr.sh 120; then
         chmod +x /tmp/bbr.sh
         bash /tmp/bbr.sh
     else
