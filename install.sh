@@ -196,13 +196,16 @@ install_watchdog() {
 
     cat > "$WATCHDOG_BIN" <<'WATCHEOF'
 #!/bin/bash
-# Gost auto-heal watchdog: restart -> reboot -> give up
+# Gost auto-heal watchdog: restart the gost services when unhealthy.
+# Automatic server REBOOT is disabled by default (ALLOW_REBOOT=0): rebooting a
+# production server on a false positive is far worse than a brief outage.
 STATE_DIR=/var/lib/gost-watchdog
 STATE_FILE="$STATE_DIR/state"
 LOG_FILE=/var/log/gost-watchdog.log
 MAX_RESTARTS=3
-GRACE_AFTER_REBOOT=300
-PROBE_TIMEOUT=3
+PROBE_TIMEOUT=5
+CONFIRM=3
+ALLOW_REBOOT=0
 
 mkdir -p "$STATE_DIR"
 touch "$LOG_FILE"
@@ -210,24 +213,24 @@ if [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then : > "$
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG_FILE"; }
 
-FAILS=0; RESTARTS=0; REBOOTED=0; LAST_REBOOT=0
+FAILS=0; RESTARTS=0
 [ -f "$STATE_FILE" ] && . "$STATE_FILE"
 
-save_state() { printf 'FAILS=%s\nRESTARTS=%s\nREBOOTED=%s\nLAST_REBOOT=%s\n' "$FAILS" "$RESTARTS" "$REBOOTED" "$LAST_REBOOT" > "$STATE_FILE"; }
-reset_state() { FAILS=0; RESTARTS=0; REBOOTED=0; LAST_REBOOT=0; save_state; }
+save_state() { printf 'FAILS=%s\nRESTARTS=%s\n' "$FAILS" "$RESTARTS" > "$STATE_FILE"; }
+reset_state() { FAILS=0; RESTARTS=0; save_state; }
 
-services_list() {
+units_list() {
   { ls /usr/lib/systemd/system/gost_*.service 2>/dev/null
     ls /etc/systemd/system/gost_*.service 2>/dev/null; } | grep -v 'multi-user.target' | sort -u
 }
 
-health_ok() {
-  local files; files=$(services_list)
+check_once() {
+  local files; files=$(units_list)
   [ -z "$files" ] && return 0
   local f u spec proto port
   for f in $files; do
     u=$(basename "$f")
-    systemctl is-active --quiet "$u" || return 1
+    systemctl is-active --quiet "$u" || { echo "unit-inactive:$u"; return 1; }
   done
   for f in $files; do
     while read -r spec; do
@@ -236,6 +239,7 @@ health_ok() {
       case "$proto" in
         tcp|grpc)
           if ! timeout "$PROBE_TIMEOUT" bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+            echo "port-closed:$port"
             return 1
           fi
           ;;
@@ -245,43 +249,57 @@ health_ok() {
   return 0
 }
 
+# Require several consecutive failed probes before acting, so temporary load or
+# a slow first packet does not trigger a needless restart.
+health_ok() {
+  local i
+  for i in $(seq 1 "$CONFIRM"); do
+    check_once >/dev/null || return 1
+    sleep 1
+  done
+  return 0
+}
+
+reason=$(check_once) || true
+
 if health_ok; then
-  if [ "$REBOOTED" = "1" ] || [ "$FAILS" != "0" ] || [ "$RESTARTS" != "0" ]; then
+  if [ "$FAILS" != "0" ] || [ "$RESTARTS" != "0" ]; then
     log "healthy; resetting state"
     reset_state
   fi
   exit 0
 fi
 
-now=$(date +%s)
 FAILS=$((FAILS+1))
 
-# Already rebooted once for this failure -> do nothing more
-if [ "$REBOOTED" = "1" ]; then
-  if [ $(( now - LAST_REBOOT )) -lt "$GRACE_AFTER_REBOOT" ]; then
-    log "unhealthy (fails=$FAILS) but inside post-reboot grace window; waiting"
-    save_state; exit 0
-  fi
-  log "still unhealthy after reboot; giving up (problem likely elsewhere). No further action."
+# Already gave up for this failure episode -> stay quiet until it recovers.
+if [ "$RESTARTS" = "-1" ]; then
   save_state; exit 0
 fi
 
-# Stage 1: restart the tunnel
+# Stage 1: restart the tunnel (up to MAX_RESTARTS times per episode).
 if [ "$RESTARTS" -lt "$MAX_RESTARTS" ]; then
-  log "unhealthy (fails=$FAILS); restarting gost services (attempt $((RESTARTS+1))/$MAX_RESTARTS)"
+  log "unhealthy (${reason:-unknown}, fails=$FAILS); restarting gost services (attempt $((RESTARTS+1))/$MAX_RESTARTS)"
   systemctl daemon-reload
-  systemctl restart gost_*.service 2>/dev/null
+  while read -r f; do
+    [ -n "$f" ] && systemctl restart "$(basename "$f")" 2>/dev/null
+  done < <(units_list)
   RESTARTS=$((RESTARTS+1)); save_state
   sleep 10
   if health_ok; then log "recovered after restart"; reset_state; exit 0; fi
   exit 0
 fi
 
-# Stage 2: restarts exhausted -> reboot once
-log "restart attempts exhausted; rebooting server once"
-REBOOTED=1; RESTARTS=0; FAILS=0; LAST_REBOOT=$now; save_state
-sync
-systemctl reboot
+# Stage 2: restarts exhausted.
+if [ "$ALLOW_REBOOT" = "1" ]; then
+  log "restart attempts exhausted; rebooting server once (ALLOW_REBOOT=1)"
+  FAILS=0; RESTARTS=0; save_state
+  sync
+  systemctl reboot
+else
+  log "restart attempts exhausted (fails=$FAILS); ALLOW_REBOOT=0 so no reboot. Manual attention needed."
+  RESTARTS=-1; save_state
+fi
 WATCHEOF
 
     chmod +x "$WATCHDOG_BIN"
@@ -365,6 +383,11 @@ read -p $'\e[97mYour choice: \e[0m' choice
 
 # If option 1 or 2 is selected
 if [ "$choice" -eq 1 ] || [ "$choice" -eq 2 ]; then
+    if ls /usr/lib/systemd/system/gost_*.service >/dev/null 2>&1; then
+        echo $'\e[33mGost is already installed. Re-applying with the new settings...\e[0m'
+    else
+        echo $'\e[32mFresh install: configuring Gost for the first time...\e[0m'
+    fi
     if [ "$choice" -eq 1 ]; then
         read -p $'\e[97mPlease enter the destination (Kharej) IPv4: \e[0m' destination_ip
     elif [ "$choice" -eq 2 ]; then
@@ -464,13 +487,25 @@ systemctl enable sysctl-custom
     done
 
     echo $'\e[32mGost configuration applied successfully.\e[0m'
+    echo $'\e[36mActive forwarding rules:\e[0m'
+    for service_file in /usr/lib/systemd/system/gost_*.service; do
+        [ -f "$service_file" ] || continue
+        u=$(basename "$service_file")
+        state=$(systemctl is-active "$u" 2>/dev/null)
+        exec_line=$(grep -m1 '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
+        echo "  - $u [$state]: $exec_line"
+    done
 
     # --- Automatic optimizations on install ---
     echo $'\e[32mRunning automatic optimizations...\e[0m'
     apply_optimizations
     install_watchdog
 
-    echo $'\e[32mAll done. Tunnel is up with auto-heal enabled.\e[0m'
+    echo $'\e[32m=================================================\e[0m'
+    echo $'\e[32mInstallation complete. Gost tunnel is up.\e[0m'
+    echo $'\e[32mDestination: '"$destination_ip"$'   Ports: '"$ports"$'   Protocol: '"$protocol"$'\e[0m'
+    echo $'\e[32mAuto-heal watchdog enabled (restart-only, no reboot).\e[0m'
+    echo $'\e[32m=================================================\e[0m'
 
     bash "$0"
 
@@ -549,7 +584,15 @@ elif [ "$choice" -eq 5 ]; then
     systemctl daemon-reload
     systemctl enable "gost_$destination_ip.service" >/dev/null 2>&1
     systemctl restart "gost_$destination_ip.service"
-    echo $'\e[32mGost configuration applied successfully.\e[0m'
+    echo $'\e[32mDone. Destination '"$destination_ip"$' added on port(s) '"$port"$' ('"$protocol"$').\e[0m'
+    echo $'\e[36mActive forwarding rules:\e[0m'
+    for service_file in /usr/lib/systemd/system/gost_*.service; do
+        [ -f "$service_file" ] || continue
+        u=$(basename "$service_file")
+        state=$(systemctl is-active "$u" 2>/dev/null)
+        exec_line=$(grep -m1 '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
+        echo "  - $u [$state]: $exec_line"
+    done
     bash "$0"
 
 # If option 6 is selected

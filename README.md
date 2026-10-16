@@ -67,21 +67,22 @@ So if gost crashes or is OOM-killed it comes back automatically, and it is
 protected from being chosen by the OOM-killer.
 
 ### 5. Auto-Heal Watchdog
-A systemd timer runs a health check every 60 seconds and escalates:
-1. **Restart** the tunnel (up to 3 attempts).
-2. Still down? **Reboot the server once**.
-3. Still down after the reboot? **Do nothing further** (the problem is probably
-   elsewhere — no reboot loop).
+A systemd timer runs a health check every 60 seconds:
+1. Probes 3 times in a row, so a temporary load spike can't cause a false positive.
+2. If actually down, it **restarts the gost services** (up to 3 attempts per episode).
+3. Still down after 3 restarts? It just logs and stands down.
 
-State is persisted, so it never reboots more than once per failure, and it resets
-automatically once the tunnel is healthy again. Health = all units active + a TCP
-probe to the listening port.
+> **Automatic server reboot is disabled by default** (`ALLOW_REBOOT=0`), because a
+> mistaken reboot of a production server is far worse than a short outage. To opt
+> in, set `ALLOW_REBOOT=1` in `/usr/local/bin/gost-watchdog.sh`.
 
-### 6. Fast-DNS assisted download
-Downloading from GitHub on an Iranian server is often slow. Every GitHub download
-now: tries the default DNS first, and if it is too slow/fails, automatically
-switches through a list of fast resolvers (Shecan, Radar, Cloudflare/Google,
-Quad9, AliDNS), then **always restores the server's original DNS** afterwards.
+State is persisted and reset automatically once the tunnel is healthy again.
+Health = all units active + a TCP probe to the listening port.
+
+### 6. CDN downloads (no DNS changes)
+Binaries are downloaded from jsDelivr (`cdn.jsdelivr.net`), which is fast and
+reliable from Iran, with `raw.githubusercontent.com` as a fallback.
+`/etc/resolv.conf` is never modified.
 
 ### 7. No version prompt
 The tunnel install always uses the **official Gost 2.11.5** — it no longer asks
