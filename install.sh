@@ -3,16 +3,7 @@
 # Check if the user has root access
 if [ "$EUID" -ne 0 ]; then
   echo $'\e[32mPlease run with root privileges.\e[0m'
-  exit 1
-fi
-
-# If the script is piped (bash <(curl ...)), copy it to /etc/gost so the
-# menu can be re-opened later through the `gost` alias.
-if [ ! -f "$0" ]; then
-    mkdir -p /etc/gost
-    wget -qO /etc/gost/install.sh https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh
-    chmod +x /etc/gost/install.sh
-    exec bash /etc/gost/install.sh
+  exit
 fi
 
 echo $'\e[35m'"  ___|              |        _ _|  _ \   /    
@@ -127,10 +118,10 @@ systemctl enable sysctl-custom
 # Download and install Gost based on user's choice
 if [ "$gost_version_choice" -eq 1 ]; then
     echo $'\e[32mInstalling Gost version 2.11.5, please wait...\e[0m' && \
-    wget -O /tmp/gost-2.11.5.gz https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz && \
+    wget -O gost-linux-amd64-2.11.5.gz https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz && \
     echo $'\e[32mGost downloaded successfully.\e[0m' && \
-    gunzip -f /tmp/gost-2.11.5.gz && \
-    sudo mv /tmp/gost-2.11.5 /usr/local/bin/gost && \
+    gunzip gost-linux-amd64-2.11.5.gz && \
+    sudo mv gost-linux-amd64-2.11.5 /usr/local/bin/gost && \
     sudo chmod +x /usr/local/bin/gost && \
     echo $'\e[32mGost installed successfully.\e[0m'
 else
@@ -357,17 +348,17 @@ elif [ "$choice" -eq 6 ]; then
     case "$gost_version_choice" in
         1)
             echo $'\e[32mInstalling Gost version 2.11.5, please wait...\e[0m' && \
-            wget -O /tmp/gost-2.11.5.gz https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz && \
+    wget -O gost-linux-amd64-2.11.5.gz https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz && \
             echo $'\e[32mGost downloaded successfully.\e[0m' && \
-            gunzip -f /tmp/gost-2.11.5.gz && \
-            sudo mv /tmp/gost-2.11.5 /usr/local/bin/gost && \
+            gunzip gost-linux-amd64-2.11.5.gz && \
+            sudo mv gost-linux-amd64-2.11.5 /usr/local/bin/gost && \
             sudo chmod +x /usr/local/bin/gost && \
             echo $'\e[32mGost installed successfully.\e[0m'
             ;;
         2)
             echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m' && \
             
-            # Gost 3.0.0 download URL
+            # Download URL for Gost 3.0.0
             download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_3.0.0.tar.gz"
 
             # Download the file to /tmp and check if it was downloaded correctly
@@ -507,9 +498,9 @@ fi
 # If option 9 is selected
 if [ "$choice" -eq 9 ]; then
     echo $'\e[32mInstalling BBR, please wait...\e[0m' && \
-    wget -O /tmp/bbr.sh https://cdn.jsdelivr.net/gh/teddysun/across@master/bbr.sh && \
-    chmod +x /tmp/bbr.sh && \
-    bash /tmp/bbr.sh
+    wget -O bbr.sh https://cdn.jsdelivr.net/gh/teddysun/across@master/bbr.sh && \
+    chmod +x bbr.sh && \
+    bash bbr.sh
     bash "$0"
 
 # If option 10 is selected
