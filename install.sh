@@ -6,365 +6,14 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-#####################################################################
-# Fast-DNS assisted download (for slow GitHub downloads from Iran)
-#####################################################################
-RESOLV=/etc/resolv.conf
-DNS_STATE=""
-
-# Ready-to-use fast resolvers (Iran-friendly first)
-DNS_CANDIDATES=(
-    "178.22.122.100 185.51.200.2"
-    "10.202.10.202 10.202.10.102"
-    "1.1.1.1 8.8.8.8"
-    "8.8.4.4 9.9.9.9"
-    "223.5.5.5 223.6.6.6"
-)
-
-dns_backup() {
-    [ -n "$DNS_STATE" ] && return 0
-    DNS_STATE=$(mktemp)
-    if [ -L "$RESOLV" ]; then
-        printf 'SYMLINK %s\n' "$(readlink "$RESOLV")" > "$DNS_STATE"
-    else
-        printf 'FILE\n' > "$DNS_STATE"
-        cat "$RESOLV" >> "$DNS_STATE" 2>/dev/null
-    fi
-}
-
-dns_apply() {
-    local servers="$1" s
-    dns_backup
-    rm -f "$RESOLV"
-    {
-        echo "# Temporary resolv.conf set by Gost installer"
-        for s in $servers; do echo "nameserver $s"; done
-    } > "$RESOLV"
-}
-
-dns_restore() {
-    [ -z "$DNS_STATE" ] && return 0
-    [ -f "$DNS_STATE" ] || return 0
-    local first
-    first=$(head -n1 "$DNS_STATE")
-    if [ "$first" = "FILE" ]; then
-        tail -n +2 "$DNS_STATE" > "$RESOLV"
-    elif [ "${first#SYMLINK }" != "$first" ]; then
-        rm -f "$RESOLV"
-        ln -sf "${first#SYMLINK }" "$RESOLV"
-    fi
-    rm -f "$DNS_STATE"; DNS_STATE=""
-    flush_dns
-}
-
-flush_dns() {
-    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1
-    command -v systemd-resolve >/dev/null 2>&1 && systemd-resolve --flush-caches >/dev/null 2>&1
-    command -v nscd >/dev/null 2>&1 && nscd -i hosts >/dev/null 2>&1
-    return 0
-}
-
-# Download $1 -> $2. If the default DNS is too slow/fails, retry over fast DNS,
-# then always restore the original DNS on the server.
-smart_download() {
-    local url="$1" out="$2" deadline="${3:-30}" set
-    if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
-        return 0
-    fi
-    echo $'\e[33mDownload is slow/failed. Trying alternate (fast) DNS...\e[0m'
-    for set in "${DNS_CANDIDATES[@]}"; do
-        dns_apply "$set"
-        flush_dns
-        echo $'\e[36mTrying DNS: '"$set"$'\e[0m'
-        if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
-            echo $'\e[32mDownloaded successfully.\e[0m'
-            dns_restore
-            return 0
-        fi
-    done
-    dns_restore
-    return 1
-}
-
-# Always put the default DNS back on the server when we exit
-trap dns_restore EXIT
-
-# If launched via process substitution (bash <(curl ...)), install self to disk
-# so that the interactive menu can re-invoke itself reliably.
+# If the script is piped (bash <(curl ...)), copy it to /etc/gost so the
+# menu can be re-opened later through the `gost` alias.
 if [ ! -f "$0" ]; then
     mkdir -p /etc/gost
-    if ! smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh" /etc/gost/install.sh 25; then
-        curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh -o /etc/gost/install.sh 2>/dev/null
-    fi
+    wget -qO /etc/gost/install.sh https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh
     chmod +x /etc/gost/install.sh
     exec bash /etc/gost/install.sh
 fi
-
-# Global paths
-WATCHDOG_BIN=/usr/local/bin/gost-watchdog.sh
-WATCHDOG_SVC=/etc/systemd/system/gost-watchdog.service
-WATCHDOG_TIMER=/etc/systemd/system/gost-watchdog.timer
-
-#####################################################################
-# Helpers
-#####################################################################
-
-# Create a swap file sized according to the server's RAM / free disk
-ensure_swap() {
-    if swapon --show --noheadings 2>/dev/null | grep -q .; then
-        echo $'\e[32mSwap already active. Skipping swap creation.\e[0m'
-        return 0
-    fi
-
-    local ram_mb swap_mb free_mb
-    ram_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
-
-    if   (( ram_mb < 1024 )); then swap_mb=2048
-    elif (( ram_mb < 2048 )); then swap_mb=2048
-    elif (( ram_mb < 4096 )); then swap_mb=2048
-    elif (( ram_mb < 8192 )); then swap_mb=1024
-    else                           swap_mb=1024
-    fi
-
-    free_mb=$(df -m / | awk 'NR==2{print $4}')
-    if (( free_mb < swap_mb + 1024 )); then
-        swap_mb=$(( free_mb - 1024 ))
-        if (( swap_mb < 512 )); then
-            echo $'\e[33mNot enough free disk for a swap file. Skipping.\e[0m'
-            return 0
-        fi
-    fi
-
-    echo $'\e[32mCreating a '"$swap_mb"$'MB swap file (RAM: '"$ram_mb"'MB)...\e[0m'
-
-    if ! fallocate -l "${swap_mb}M" /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
-    fi
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-
-    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    sysctl -w vm.swappiness=10 >/dev/null 2>&1
-
-    echo $'\e[32mSwap enabled successfully.\e[0m'
-}
-
-# Network / kernel tuning for many concurrent connections
-apply_sysctl() {
-    echo $'\e[32mApplying network & system tuning...\e[0m'
-    modprobe nf_conntrack 2>/dev/null
-
-    cat > /etc/sysctl.d/99-gost-tuning.conf <<'EOF'
-# Gost-ip6 optimized tuning
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 16384
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-fs.file-max = 1048576
-vm.swappiness = 10
-EOF
-
-    if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
-        cat >> /etc/sysctl.d/99-gost-tuning.conf <<'EOF'
-net.netfilter.nf_conntrack_max = 262144
-net.netfilter.nf_conntrack_tcp_timeout_established = 600
-EOF
-    fi
-
-    sysctl --system >/dev/null 2>&1
-    echo $'\e[32mTuning applied.\e[0m'
-}
-
-# Cap journald disk usage (gost logs every connection -> huge journals)
-cap_journald() {
-    echo $'\e[32mCapping journald size...\e[0m'
-    mkdir -p /etc/systemd/journald.conf.d
-    cat > /etc/systemd/journald.conf.d/99-gost.conf <<'EOF'
-[Journal]
-SystemMaxUse=200M
-SystemMaxFileSize=50M
-EOF
-    systemctl restart systemd-journald 2>/dev/null
-    journalctl --vacuum-size=200M >/dev/null 2>&1
-    echo $'\e[32mjournald capped at 200M.\e[0m'
-}
-
-# Write a hardened gost systemd unit (auto-restart + OOM protection)
-write_gost_unit() {
-    local unitname="$1"
-    local exec_line="$2"
-    cat > "/usr/lib/systemd/system/${unitname}.service" <<EOL
-[Unit]
-Description=GO Simple Tunnel
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-Environment="GOST_LOGGER_LEVEL=fatal"
-Restart=always
-RestartSec=5
-OOMScoreAdjust=-1000
-LimitNOFILE=1048576
-TasksMax=infinity
-${exec_line}
-
-[Install]
-WantedBy=multi-user.target
-EOL
-}
-
-# Install the auto-heal watchdog (restart -> reboot -> give up)
-install_watchdog() {
-    echo $'\e[32mInstalling Auto-Heal watchdog...\e[0m'
-
-    cat > "$WATCHDOG_BIN" <<'WATCHEOF'
-#!/bin/bash
-# Gost auto-heal watchdog: restart -> reboot -> give up
-STATE_DIR=/var/lib/gost-watchdog
-STATE_FILE="$STATE_DIR/state"
-LOG_FILE=/var/log/gost-watchdog.log
-MAX_RESTARTS=3
-GRACE_AFTER_REBOOT=300
-PROBE_TIMEOUT=3
-
-mkdir -p "$STATE_DIR"
-touch "$LOG_FILE"
-if [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then : > "$LOG_FILE"; fi
-
-log() { echo "$(date '+%F %T') $*" >> "$LOG_FILE"; }
-
-FAILS=0; RESTARTS=0; REBOOTED=0; LAST_REBOOT=0
-[ -f "$STATE_FILE" ] && . "$STATE_FILE"
-
-save_state() { printf 'FAILS=%s\nRESTARTS=%s\nREBOOTED=%s\nLAST_REBOOT=%s\n' "$FAILS" "$RESTARTS" "$REBOOTED" "$LAST_REBOOT" > "$STATE_FILE"; }
-reset_state() { FAILS=0; RESTARTS=0; REBOOTED=0; LAST_REBOOT=0; save_state; }
-
-services_list() {
-  { ls /usr/lib/systemd/system/gost_*.service 2>/dev/null
-    ls /etc/systemd/system/gost_*.service 2>/dev/null; } | grep -v 'multi-user.target' | sort -u
-}
-
-health_ok() {
-  local files; files=$(services_list)
-  [ -z "$files" ] && return 0
-  local f u spec proto port
-  for f in $files; do
-    u=$(basename "$f")
-    systemctl is-active --quiet "$u" || return 1
-  done
-  for f in $files; do
-    while read -r spec; do
-      [ -z "$spec" ] && continue
-      proto="${spec%%://*}"; port="${spec##*:}"
-      case "$proto" in
-        tcp|grpc)
-          if ! timeout "$PROBE_TIMEOUT" bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
-            return 1
-          fi
-          ;;
-      esac
-    done < <(grep -oP '(tcp|grpc)://:[0-9]+(?=/\[)' "$f" 2>/dev/null | head -3)
-  done
-  return 0
-}
-
-if health_ok; then
-  if [ "$REBOOTED" = "1" ] || [ "$FAILS" != "0" ] || [ "$RESTARTS" != "0" ]; then
-    log "healthy; resetting state"
-    reset_state
-  fi
-  exit 0
-fi
-
-now=$(date +%s)
-FAILS=$((FAILS+1))
-
-# Already rebooted once for this failure -> do nothing more
-if [ "$REBOOTED" = "1" ]; then
-  if [ $(( now - LAST_REBOOT )) -lt "$GRACE_AFTER_REBOOT" ]; then
-    log "unhealthy (fails=$FAILS) but inside post-reboot grace window; waiting"
-    save_state; exit 0
-  fi
-  log "still unhealthy after reboot; giving up (problem likely elsewhere). No further action."
-  save_state; exit 0
-fi
-
-# Stage 1: restart the tunnel
-if [ "$RESTARTS" -lt "$MAX_RESTARTS" ]; then
-  log "unhealthy (fails=$FAILS); restarting gost services (attempt $((RESTARTS+1))/$MAX_RESTARTS)"
-  systemctl daemon-reload
-  systemctl restart gost_*.service 2>/dev/null
-  RESTARTS=$((RESTARTS+1)); save_state
-  sleep 10
-  if health_ok; then log "recovered after restart"; reset_state; exit 0; fi
-  exit 0
-fi
-
-# Stage 2: restarts exhausted -> reboot once
-log "restart attempts exhausted; rebooting server once"
-REBOOTED=1; RESTARTS=0; FAILS=0; LAST_REBOOT=$now; save_state
-sync
-systemctl reboot
-WATCHEOF
-
-    chmod +x "$WATCHDOG_BIN"
-
-    cat > "$WATCHDOG_SVC" <<'EOF'
-[Unit]
-Description=Gost tunnel watchdog (auto-heal)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/gost-watchdog.sh
-EOF
-
-    cat > "$WATCHDOG_TIMER" <<'EOF'
-[Unit]
-Description=Run gost watchdog periodically
-
-[Timer]
-OnBootSec=90
-OnUnitActiveSec=60
-AccuracySec=5
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now gost-watchdog.timer >/dev/null 2>&1
-    echo $'\e[32mAuto-Heal watchdog installed & enabled (checks every 60s).\e[0m'
-}
-
-remove_watchdog() {
-    systemctl disable --now gost-watchdog.timer >/dev/null 2>&1
-    rm -f "$WATCHDOG_BIN" "$WATCHDOG_SVC" "$WATCHDOG_TIMER"
-    systemctl daemon-reload
-    echo $'\e[32mAuto-Heal watchdog removed.\e[0m'
-}
-
-# Apply the full optimization bundle
-apply_optimizations() {
-    ensure_swap
-    apply_sysctl
-    cap_journald
-}
-
-#####################################################################
-# Banner + menu
-#####################################################################
 
 echo $'\e[35m'"  ___|              |        _ _|  _ \   /    
  |      _ \    __|  __|        |  |   |  _ \  
@@ -373,8 +22,7 @@ echo $'\e[35m'"  ___|              |        _ _|  _ \   /
                                               "$'\e[0m'
 
 echo -e "\e[36mCreated By Masoud Gb Special Thanks Hamid Router\e[0m"
-echo -e "\e[36mOptimized Fork by Aknuun (Auto Swap + Tuning + Auto-Heal)\e[0m"
-echo $'\e[35m'"Gost Ip6 Script v2.3.0-opt"$'\e[0m'
+echo $'\e[35m'"Gost Ip6 Script v2.2.0"$'\e[0m'
 
 options=($'\e[36m1. \e[0mGost Tunnel By IP4'
          $'\e[36m2. \e[0mGost Tunnel By IP6'
@@ -386,14 +34,13 @@ options=($'\e[36m1. \e[0mGost Tunnel By IP4'
          $'\e[36m8. \e[0mAuto Clear Cache'
          $'\e[36m9. \e[0mInstall BBR'
          $'\e[36m10. \e[0mUninstall'
-         $'\e[36m11. \e[0mApply Optimizations (Swap + Tuning)'
-         $'\e[36m12. \e[0mInstall Auto-Heal Watchdog'
-         $'\e[36m13. \e[0mRemove Auto-Heal Watchdog'
-         $'\e[36m14. \e[0mExit')
+         $'\e[36m11. \e[0mExit')
 
+# Print prompt and options with cyan color
 printf "\e[32mPlease Choice Your Options:\e[0m\n"
 printf "%s\n" "${options[@]}"
 
+# Read user input with white color
 read -p $'\e[97mYour choice: \e[0m' choice
 
 # If option 1 or 2 is selected
@@ -413,6 +60,7 @@ elif [ "$port_option" -eq 2 ]; then
 
     IFS=',' read -ra port_array <<< "$port_range"
 
+    # Check if the start and end port values are within the valid range
     if [ "${port_array[0]}" -lt 54 -o "${port_array[1]}" -gt 65000 ]; then
         echo $'\e[33mInvalid port range. Please enter a valid range starting from 54 and up to 65000.\e[0m'
         exit
@@ -442,10 +90,13 @@ fi
     echo $'\e[97mPorts:\e[0m' $ports
     echo $'\e[97mProtocol:\e[0m' $protocol
 
+    # Commands to install and configure Gost
     echo $'\e[32mUpdating system packages, please wait...\e[0m'
     sysctl net.ipv4.ip_local_port_range="1024 65535"
+# Add the sysctl command to the end of the script
 echo "sysctl net.ipv4.ip_local_port_range=\"1024 65535\"" >> /etc/rc.local
 
+# Enable the systemd service to run the sysctl command after reboot
 cat <<EOL > /etc/systemd/system/sysctl-custom.service
 [Unit]
 Description=Custom sysctl settings
@@ -456,68 +107,140 @@ ExecStart=/sbin/sysctl net.ipv4.ip_local_port_range="1024 65535"
 [Install]
 WantedBy=multi-user.target
 EOL
+# Enable the service
 systemctl enable sysctl-custom
 
-    apt update && apt install wget nano -y && \
+    apt update && sudo apt install wget nano -y && \
+    # Add alias for 'gost' to execute the script
         echo 'alias gost="bash /etc/gost/install.sh"' >> ~/.bashrc
         source ~/.bashrc
         echo $'\e[32mSymbolic link created: /usr/local/bin/gost\e[0m'
     echo $'\e[32mSystem update completed.\e[0m'
+    # Prompt user to choose Gost version
+    echo $'\e[32mChoose Gost version:\e[0m'
+    echo $'\e[36m1. \e[0mGost version 2.11.5 (official)'
+    echo $'\e[36m2. \e[0mGost version 3.0.0 (latest)'
 
-    echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-    if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
-        gunzip -f /tmp/gost-2.11.5.gz
-        mv /tmp/gost-2.11.5 /usr/local/bin/gost
+    # Read user input for Gost version
+    read -p $'\e[97mYour choice: \e[0m' gost_version_choice
+
+# Download and install Gost based on user's choice
+if [ "$gost_version_choice" -eq 1 ]; then
+    echo $'\e[32mInstalling Gost version 2.11.5, please wait...\e[0m' && \
+    wget -O /tmp/gost-2.11.5.gz https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz && \
+    echo $'\e[32mGost downloaded successfully.\e[0m' && \
+    gunzip -f /tmp/gost-2.11.5.gz && \
+    sudo mv /tmp/gost-2.11.5 /usr/local/bin/gost && \
+    sudo chmod +x /usr/local/bin/gost && \
+    echo $'\e[32mGost installed successfully.\e[0m'
+else
+    if [ "$gost_version_choice" -eq 2 ]; then
+        echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
+        
+        # Use the direct download link for Gost 3.0.0
+        download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_3.0.0.tar.gz"
+
+        # Download the file to /tmp and check if it was downloaded correctly
+        echo $'\e[32mDownloading Gost 3.0.0...\e[0m'
+        wget -O /tmp/gost.tar.gz "$download_url"
+        
+        # Check if the file was downloaded successfully
+        if [ ! -f /tmp/gost.tar.gz ]; then
+            echo $'\e[31mError: Download failed. The file was not saved correctly.\e[0m'
+            exit 1
+        fi
+
+        # Check if the file is not empty
+        if [ ! -s /tmp/gost.tar.gz ]; then
+            echo $'\e[31mError: The downloaded file is empty.\e[0m'
+            exit 1
+        fi
+
+        # Extract the downloaded file
+        tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/
         chmod +x /usr/local/bin/gost
-        echo $'\e[32mGost installed successfully.\e[0m'
+        echo $'\e[32mGost 3.0.0 installed successfully.\e[0m'
     else
-        echo $'\e[31mError: Download failed. Check the server connectivity.\e[0m'
-        exit 1
+        echo $'\e[31mInvalid choice. Exiting...\e[0m'
+        exit
     fi
+fi
 
+    # Continue creating the systemd service file
+    exec_start_command="ExecStart=/usr/local/bin/gost"
+
+    # Add lines for each port
     IFS=',' read -ra port_array <<< "$ports"
     port_count=${#port_array[@]}
+
+    # Set the maximum number of ports per file
     max_ports_per_file=12000
+
+    # Calculate the number of files needed
     file_count=$(( (port_count + max_ports_per_file - 1) / max_ports_per_file ))
 
+    # Continue creating the systemd service files
     for ((file_index = 0; file_index < file_count; file_index++)); do
+        # Create a new systemd service file
+        cat <<EOL | sudo tee "/usr/lib/systemd/system/gost_$file_index.service" > /dev/null
+[Unit]
+Description=GO Simple Tunnel
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+Environment="GOST_LOGGER_LEVEL=fatal"
+EOL
+
+        # Add lines for each port in the current file
         exec_start_command="ExecStart=/usr/local/bin/gost"
         for ((i = file_index * max_ports_per_file; i < (file_index + 1) * max_ports_per_file && i < port_count; i++)); do
             port="${port_array[i]}"
             exec_start_command+=" -L=$protocol://:$port/[$destination_ip]:$port"
         done
 
-        write_gost_unit "gost_$file_index" "$exec_start_command"
+        # Append the ExecStart command to the current file
+        echo "$exec_start_command" | sudo tee -a "/usr/lib/systemd/system/gost_$file_index.service" > /dev/null
+
+        # Complete the current systemd service file
+        cat <<EOL | sudo tee -a "/usr/lib/systemd/system/gost_$file_index.service" > /dev/null
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+        # Reload and restart the systemd service
+        sudo systemctl enable "gost_$file_index.service"
+        sudo systemctl start "gost_$file_index.service"
+        sudo systemctl daemon-reload
+        sudo systemctl restart "gost_$file_index.service"
     done
 
-    systemctl daemon-reload
-    for ((file_index = 0; file_index < file_count; file_index++)); do
-        systemctl enable "gost_$file_index.service" >/dev/null 2>&1
-        systemctl restart "gost_$file_index.service"
-    done
-
-    echo $'\e[32mGost configuration applied successfully.\e[0m'
-
-    # --- Automatic optimizations on install ---
-    echo $'\e[32mRunning automatic optimizations...\e[0m'
-    apply_optimizations
-    install_watchdog
-
-    echo $'\e[32mAll done. Tunnel is up with auto-heal enabled.\e[0m'
-
-    bash "$0"
-
+echo $'\e[32mGost configuration applied successfully.\e[0m'
+    
 # If option 3 is selected
 elif [ "$choice" -eq 3 ]; then
+    # Check if Gost is installed
     if command -v gost &>/dev/null; then
         echo $'\e[32mGost is installed. Checking configuration and status...\e[0m'
+        
+        # Check Gost configuration and status
         systemctl list-unit-files | grep -q "gost_"
         if [ $? -eq 0 ]; then
             echo $'\e[32mGost is configured and active.\e[0m'
+            
+            # Get and display used IPs and ports
             for service_file in /usr/lib/systemd/system/gost_*.service; do
+                # Extract the IP, port, and protocol information using awk
                 service_info=$(awk -F'[-=:/\\[\\]]+' '/ExecStart=/ {print $14,$15,$22,$20,$23}' "$service_file")
+
+                # Split the extracted information into an array
                 read -a info_array <<< "$service_info"
+
+                # Display IP, port, and protocol information with corrected port range
                 echo -e "\e[97mIP:\e[0m ${info_array[0]} \e[97mPort:\e[0m ${info_array[1]},... \e[97mProtocol:\e[0m ${info_array[2]}"
+
             done
         else
             echo $'\e[33mGost is installed, but not configured or active.\e[0m'
@@ -527,26 +250,31 @@ elif [ "$choice" -eq 3 ]; then
     fi
 
     read -n 1 -s -r -p $'\e[36m0. \e[0mBack to menu: \e[0m' choice
-    if [ "$choice" -eq 0 ]; then
-        bash "$0"
-    fi
+
+if [ "$choice" -eq 0 ]; then
+    bash "$0"
+fi
 
 # If option 4 is selected
 elif [ "$choice" -eq 4 ]; then
     read -p $'\e[32mDo you want to update Gost script? (y/n): \e[0m' update_choice
+
     if [ "$update_choice" == "y" ]; then
-        echo $'\e[32mUpdating Gost script, please wait...\e[0m'
-        mkdir -p /etc/gost
-        smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh" /etc/gost/install.sh 25
-        chmod +x /etc/gost/install.sh
+        echo $'\e[32mUpdating Gost, please wait...\e[0m'
+        # Save install.sh in /etc/gost directory
+        sudo mkdir -p /etc/gost
+wget -O /etc/gost/install.sh https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh
+chmod +x /etc/gost/install.sh
         echo $'\e[32mUpdate completed.\e[0m'
     else
         echo $'\e[32mUpdate canceled.\e[0m'
     fi
+
     bash "$0"
+fi
 
 # If option 5 is selected
-elif [ "$choice" -eq 5 ]; then
+if [ "$choice" -eq 5 ]; then
     read -p $'\e[97mPlease enter the new destination (Kharej) IP 4 or 6: \e[0m' destination_ip
     read -p $'\e[36mPlease enter the new port (separated by commas): \e[0m' port
     read -p $'\e[32mSelect the protocol:\n\e[0m\e[36m1. \e[0mBy Tcp Protocol \n\e[36m2. \e[0mBy Grpc Protocol \e[32m\nYour choice: \e[0m' protocol_option
@@ -560,63 +288,108 @@ elif [ "$choice" -eq 5 ]; then
         exit
     fi
 
+    # Use the default protocol previously entered
     echo $'\e[32mYou chose option\e[0m' $choice
     echo $'\e[97mDestination IP:\e[0m' $destination_ip
     echo $'\e[97mPort(s):\e[0m' $port
     echo $'\e[97mProtocol:\e[0m' $protocol
 
+    # Create the systemd service file
+    cat <<EOL | sudo tee "/usr/lib/systemd/system/gost_$destination_ip.service" > /dev/null
+[Unit]
+Description=GO Simple Tunnel
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+Environment="GOST_LOGGER_LEVEL=fatal"
+EOL
+
+    # Add lines for each port
     IFS=',' read -ra port_array <<< "$port"
     port_count=${#port_array[@]}
+
+    # Set the maximum number of ports per file
     max_ports_per_file=12000
+
+    # Calculate the number of files needed
     file_count=$(( (port_count + max_ports_per_file - 1) / max_ports_per_file ))
 
     for ((file_index = 0; file_index < file_count; file_index++)); do
+        # Add lines for each port in the current file
         exec_start_command="ExecStart=/usr/local/bin/gost"
         for ((i = file_index * max_ports_per_file; i < (file_index + 1) * max_ports_per_file && i < port_count; i++)); do
             port="${port_array[i]}"
             exec_start_command+=" -L=$protocol://:$port/[$destination_ip]:$port"
         done
-        write_gost_unit "gost_$destination_ip" "$exec_start_command"
+
+        # Append the ExecStart command to the current file
+        echo "$exec_start_command" | sudo tee -a "/usr/lib/systemd/system/gost_$destination_ip.service" > /dev/null
     done
 
-    systemctl daemon-reload
-    systemctl enable "gost_$destination_ip.service" >/dev/null 2>&1
-    systemctl restart "gost_$destination_ip.service"
+    # Complete the systemd service file
+    cat <<EOL | sudo tee -a "/usr/lib/systemd/system/gost_$destination_ip.service" > /dev/null
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+    # Reload and restart the systemd service
+    sudo systemctl enable "gost_$destination_ip.service"
+    sudo systemctl start "gost_$destination_ip.service"
+    sudo systemctl daemon-reload
+    sudo systemctl restart "gost_$destination_ip.service"
+    
     echo $'\e[32mGost configuration applied successfully.\e[0m'
     bash "$0"
-
-# If option 6 is selected
+    
+ # If option 6 is selected
 elif [ "$choice" -eq 6 ]; then
     echo $'\e[32mChoose Gost version:\e[0m'
     echo $'\e[36m1. \e[0mGost version 2.11.5 (official)'
     echo $'\e[36m2. \e[0mGost version 3.x (latest)'
 
+    # Read user input for Gost version choice
     read -p $'\e[97mYour choice: \e[0m' gost_version_choice
 
+    # Download and install Gost based on user's choice
     case "$gost_version_choice" in
         1)
-            echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-            if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
-                gunzip -f /tmp/gost-2.11.5.gz
-                mv /tmp/gost-2.11.5 /usr/local/bin/gost
-                chmod +x /usr/local/bin/gost
-                echo $'\e[32mGost installed successfully.\e[0m'
-            else
-                echo $'\e[31mError: Download failed. Check the server connectivity.\e[0m'
-                exit 1
-            fi
+            echo $'\e[32mInstalling Gost version 2.11.5, please wait...\e[0m' && \
+            wget -O /tmp/gost-2.11.5.gz https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz && \
+            echo $'\e[32mGost downloaded successfully.\e[0m' && \
+            gunzip -f /tmp/gost-2.11.5.gz && \
+            sudo mv /tmp/gost-2.11.5 /usr/local/bin/gost && \
+            sudo chmod +x /usr/local/bin/gost && \
+            echo $'\e[32mGost installed successfully.\e[0m'
             ;;
         2)
-            echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
+            echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m' && \
+            
+            # Gost 3.0.0 download URL
             download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_3.0.0.tar.gz"
-            if smart_download "$download_url" /tmp/gost.tar.gz 40; then
-                tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
-                chmod +x /usr/local/bin/gost && \
-                echo $'\e[32mGost 3.x installed successfully.\e[0m'
-            else
-                echo $'\e[31mError: Download failed or file empty.\e[0m'
+
+            # Download the file to /tmp and check if it was downloaded correctly
+            echo $'\e[32mDownloading Gost 3.0.0...\e[0m'
+            wget -O /tmp/gost.tar.gz "$download_url"
+            
+            # Check if the file was downloaded successfully
+            if [ ! -f /tmp/gost.tar.gz ]; then
+                echo $'\e[31mError: Download failed. The file was not saved correctly.\e[0m'
                 exit 1
             fi
+
+            # Check if the file is not empty
+            if [ ! -s /tmp/gost.tar.gz ]; then
+                echo $'\e[31mError: The downloaded file is empty.\e[0m'
+                exit 1
+            fi
+
+            # Extract the downloaded file
+            tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
+            chmod +x /usr/local/bin/gost && \
+            echo $'\e[32mGost 3.x installed successfully.\e[0m'
             ;;
         *)
             echo $'\e[31mInvalid choice. Exiting...\e[0m'
@@ -624,30 +397,50 @@ elif [ "$choice" -eq 6 ]; then
             ;;
     esac
     bash "$0"
-
+    
 # If option 7 is selected
 elif [ "$choice" -eq 7 ]; then
     echo $'\e[32mChoose Auto Restart option:\e[0m'
     echo $'\e[36m1. \e[0mEnable Auto Restart'
     echo $'\e[36m2. \e[0mDisable Auto Restart'
 
+    # Read user input for Auto Restart option
     read -p $'\e[97mYour choice: \e[0m' auto_restart_option
 
+    # Process user choice for Auto Restart
     case "$auto_restart_option" in
         1)
+            # Logic to enable Auto Restart
             echo $'\e[32mAuto Restart Enabled.\e[0m'
-            command -v at >/dev/null 2>&1 && { at -l | awk '{print $1}' | xargs -I {} atrm {}; }
+            # Remove any existing scheduled restart using 'at' command
+            sudo at -l | awk '{print $1}' | xargs -I {} atrm {}
+            # Prompt the user for the restart time in hours
             read -p $'\e[97mEnter the restart time in hours: \e[0m' restart_time_hours
-            echo -e "#!/bin/bash\n\nsystemctl daemon-reload\nsystemctl restart gost_*.service" | tee /usr/bin/auto_restart_cronjob.sh > /dev/null
-            chmod +x /usr/bin/auto_restart_cronjob.sh
-            crontab -l 2>/dev/null | grep -v '/usr/bin/auto_restart_cronjob.sh' | crontab -
-            (crontab -l 2>/dev/null ; echo "0 */$restart_time_hours * * * /usr/bin/auto_restart_cronjob.sh") | crontab -
+
+            # Convert hours to minutes
+            restart_time_minutes=$((restart_time_hours * 60))
+
+            # Write a script to restart Gost
+            echo -e "#!/bin/bash\n\nsudo systemctl daemon-reload\nsudo systemctl restart gost_*.service" | sudo tee /usr/bin/auto_restart_cronjob.sh > /dev/null
+
+            # Give execute permission to the script
+            sudo chmod +x /usr/bin/auto_restart_cronjob.sh
+
+            # Remove any existing cron job for Auto Restart
+            crontab -l | grep -v '/usr/bin/auto_restart_cronjob.sh' | crontab -
+
+            # Write a new cron job to execute the script at the specified intervals
+            (crontab -l ; echo "0 */$restart_time_hours * * * /usr/bin/auto_restart_cronjob.sh") | crontab -
+
             echo $'\e[32mAuto Restart scheduled successfully.\e[0m'
             ;;
         2)
+            # Logic to disable Auto Restart
             echo $'\e[32mAuto Restart Disabled.\e[0m'
-            rm -f /usr/bin/auto_restart_cronjob.sh
-            crontab -l 2>/dev/null | grep -v '/usr/bin/auto_restart_cronjob.sh' | crontab -
+            # Remove the script and cron job for Auto Restart
+            sudo rm -f /usr/bin/auto_restart_cronjob.sh
+            crontab -l | grep -v '/usr/bin/auto_restart_cronjob.sh' | crontab -
+
             echo $'\e[32mAuto Restart disabled successfully.\e[0m'
             ;;
         *)
@@ -655,92 +448,106 @@ elif [ "$choice" -eq 7 ]; then
             exit
             ;;
     esac
-    bash "$0"
+ bash "$0"
+fi
 
 # If option 8 is selected
-elif [ "$choice" -eq 8 ]; then
+if [ "$choice" -eq 8 ]; then
     echo $'\e[32mChoose Auto Clear Cache option:\e[0m'
     echo $'\e[36m1. \e[0mEnable Auto Clear Cache'
     echo $'\e[36m2. \e[0mDisable Auto Clear Cache'
 
+    # Read user input for Auto Clear Cache option
     read -p $'\e[97mYour choice: \e[0m' auto_clear_cache_option
 
+    # Process user choice for Auto Clear Cache
     case "$auto_clear_cache_option" in
         1)
-            echo $'\e[32mAuto Clear Cache Enabled.\e[0m'
-            read -p $'\e[97mEnter the interval in days (e.g., 1 for daily, 7 for weekly): \e[0m' interval_days
-            cron_interval="0 0 */$interval_days * *"
-            (crontab -l 2>/dev/null; echo "$cron_interval sync; echo 1 > /proc/sys/vm/drop_caches && sync; echo 2 > /proc/sys/vm/drop_caches && sync; echo 3 > /proc/sys/vm/drop_caches") | crontab -
-            echo $'\e[32mAuto Clear Cache scheduled successfully.\e[0m'
+            # Enable Auto Clear Cache
+            enable_auto_clear_cache() {
+                echo $'\e[32mAuto Clear Cache Enabled.\e[0m'
+                
+                # Prompt user to choose the interval in days
+                read -p $'\e[97mEnter the interval in days (e.g., 1 for daily, 7 for weekly): \e[0m' interval_days
+                
+                # Set up the cron job based on the interval
+                cron_interval="0 0 */$interval_days * *"
+
+                # Write a new cron job to execute the cache clearing commands at the specified interval
+                (crontab -l 2>/dev/null; echo "$cron_interval sync; echo 1 > /proc/sys/vm/drop_caches && sync; echo 2 > /proc/sys/vm/drop_caches && sync; echo 3 > /proc/sys/vm/drop_caches") | crontab -
+
+                echo $'\e[32mAuto Clear Cache scheduled successfully.\e[0m'
+            }
+
+            # Call the function to enable Auto Clear Cache
+            enable_auto_clear_cache
             ;;
         2)
-            echo $'\e[32mAuto Clear Cache Disabled.\e[0m'
-            crontab -l 2>/dev/null | grep -v "drop_caches" | crontab -
-            echo $'\e[32mAuto Clear Cache disabled successfully.\e[0m'
+            # Disable Auto Clear Cache
+            disable_auto_clear_cache() {
+                echo $'\e[32mAuto Clear Cache Disabled.\e[0m'
+                
+                # Remove only the cron job related to auto clearing cache
+                crontab -l | grep -v "drop_caches" | crontab -
+
+                echo $'\e[32mAuto Clear Cache disabled successfully.\e[0m'
+            }
+
+            # Call the function to disable Auto Clear Cache
+            disable_auto_clear_cache
             ;;
         *)
             echo $'\e[31mInvalid choice. Exiting...\e[0m'
             exit
             ;;
     esac
-    bash "$0"
+ bash "$0"
+fi
 
 # If option 9 is selected
-elif [ "$choice" -eq 9 ]; then
-    echo $'\e[32mInstalling BBR, please wait...\e[0m'
-    if smart_download "https://cdn.jsdelivr.net/gh/teddysun/across@master/bbr.sh" /tmp/bbr.sh 30; then
-        chmod +x /tmp/bbr.sh
-        bash /tmp/bbr.sh
-    else
-        echo $'\e[31mError: Could not download BBR script.\e[0m'
-    fi
+if [ "$choice" -eq 9 ]; then
+    echo $'\e[32mInstalling BBR, please wait...\e[0m' && \
+    wget -O /tmp/bbr.sh https://cdn.jsdelivr.net/gh/teddysun/across@master/bbr.sh && \
+    chmod +x /tmp/bbr.sh && \
+    bash /tmp/bbr.sh
     bash "$0"
 
 # If option 10 is selected
 elif [ "$choice" -eq 10 ]; then
+    # Prompt the user for confirmation
     read -p $'\e[91mWarning\e[33m: This will uninstall Gost and remove all related data. Are you sure you want to continue? (y/n): ' uninstall_confirm
 
+    # Check user confirmation
     if [ "$uninstall_confirm" == "y" ]; then
+        # Countdown for uninstallation in a single line
         echo $'\e[32mUninstalling Gost in 3 seconds... \e[0m' && sleep 1 && echo $'\e[32m2... \e[0m' && sleep 1 && echo $'\e[32m1... \e[0m' && sleep 1 && {
-            rm -f /usr/bin/auto_restart_cronjob.sh
-            crontab -l 2>/dev/null | grep -v '/usr/bin/auto_restart_cronjob.sh' | crontab -
-            remove_watchdog
+            # Remove the auto_restart_cronjob.sh script
+            sudo rm -f /usr/bin/auto_restart_cronjob.sh
+
+            # Remove the cron job for Auto Restart
+            crontab -l | grep -v '/usr/bin/auto_restart_cronjob.sh' | crontab -
+
+            # Continue with the rest of the uninstallation process
+            sudo systemctl daemon-reload
+            sudo systemctl stop gost_*.service
+            sudo rm -f /usr/local/bin/gost
+            sudo rm -rf /etc/gost
+            sudo rm -f /usr/lib/systemd/system/gost_*.service
+            sudo rm -f /etc/systemd/system/multi-user.target.wants/gost_*.service
+            systemctl stop sysctl-custom
+            systemctl disable sysctl-custom
+            sudo rm -f /etc/systemd/system/sysctl-custom.service
+            sudo rm -f /etc/systemd/system/multi-user.target.wants/sysctl-custom.service
             systemctl daemon-reload
-            systemctl stop gost_*.service 2>/dev/null
-            rm -f /usr/local/bin/gost
-            rm -rf /etc/gost
-            rm -f /usr/lib/systemd/system/gost_*.service
-            rm -f /etc/systemd/system/multi-user.target.wants/gost_*.service
-            systemctl stop sysctl-custom 2>/dev/null
-            systemctl disable sysctl-custom 2>/dev/null
-            rm -f /etc/systemd/system/sysctl-custom.service
-            rm -f /etc/systemd/system/multi-user.target.wants/sysctl-custom.service
-            systemctl daemon-reload
+            
             echo $'\e[32mGost successfully uninstalled.\e[0m'
         }
     else
         echo $'\e[32mUninstallation canceled.\e[0m'
     fi
-
+    
 # If option 11 is selected
 elif [ "$choice" -eq 11 ]; then
-    apply_optimizations
-    echo $'\e[32mOptimizations applied successfully.\e[0m'
-    bash "$0"
-
-# If option 12 is selected
-elif [ "$choice" -eq 12 ]; then
-    install_watchdog
-    echo $'\e[32mAuto-Heal watchdog installed successfully.\e[0m'
-    bash "$0"
-
-# If option 13 is selected
-elif [ "$choice" -eq 13 ]; then
-    remove_watchdog
-    bash "$0"
-
-# If option 14 is selected
-elif [ "$choice" -eq 14 ]; then
     echo $'\e[32mYou have exited the script.\e[0m'
     exit
 fi
