@@ -16,7 +16,7 @@
 روی سرور و با دسترسی **root** اجرا کنید:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/install.sh)
 ```
 
 اسکریپت خودش را در `/etc/gost/install.sh` نصب می‌کند، بنابراین بعد از آن فقط با تایپ:

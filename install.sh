@@ -93,8 +93,8 @@ trap dns_restore EXIT
 # so that the interactive menu can re-invoke itself reliably.
 if [ ! -f "$0" ]; then
     mkdir -p /etc/gost
-    if ! smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh" /etc/gost/install.sh 25; then
-        curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh -o /etc/gost/install.sh 2>/dev/null
+    if ! smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/install.sh" /etc/gost/install.sh 25; then
+        curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/install.sh -o /etc/gost/install.sh 2>/dev/null
     fi
     chmod +x /etc/gost/install.sh
     exec bash /etc/gost/install.sh
@@ -465,7 +465,7 @@ systemctl enable sysctl-custom
     echo $'\e[32mSystem update completed.\e[0m'
 
     echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-    if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+    if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
         gunzip -f /tmp/gost-2.11.5.gz
         mv /tmp/gost-2.11.5 /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
@@ -537,7 +537,7 @@ elif [ "$choice" -eq 4 ]; then
     if [ "$update_choice" == "y" ]; then
         echo $'\e[32mUpdating Gost script, please wait...\e[0m'
         mkdir -p /etc/gost
-        smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh" /etc/gost/install.sh 25
+        smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/install.sh" /etc/gost/install.sh 25
         chmod +x /etc/gost/install.sh
         echo $'\e[32mUpdate completed.\e[0m'
     else
@@ -596,7 +596,7 @@ elif [ "$choice" -eq 6 ]; then
     case "$gost_version_choice" in
         1)
             echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-            if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+            if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
                 gunzip -f /tmp/gost-2.11.5.gz
                 mv /tmp/gost-2.11.5 /usr/local/bin/gost
                 chmod +x /usr/local/bin/gost
@@ -608,7 +608,7 @@ elif [ "$choice" -eq 6 ]; then
             ;;
         2)
             echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
-            download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_3.0.0.tar.gz"
+            download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/gost/gost_3.0.0.tar.gz"
             if smart_download "$download_url" /tmp/gost.tar.gz 40; then
                 tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
                 chmod +x /usr/local/bin/gost && \

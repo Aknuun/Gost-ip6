@@ -16,7 +16,7 @@ server optimization and a self-healing watchdog.
 Run as **root** on your server:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Aknuun/Gost-ip6/main/install.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/install.sh)
 ```
 
 The script self-installs to `/etc/gost/install.sh`, so afterwards you can just type:
