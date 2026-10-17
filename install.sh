@@ -7,62 +7,95 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 #####################################################################
-# Download helper (never touches /etc/resolv.conf)
+# Fast-DNS assisted download (for slow GitHub downloads from Iran)
 #####################################################################
-# jsDelivr CDN is used first: it is fast and reachable from Iran even when
-# GitHub release assets are throttled/slow. raw.githubusercontent.com is the
-# fallback.
-SELF_CDN="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main"
-SELF_RAW="https://raw.githubusercontent.com/Aknuun/Gost-ip6/main"
+RESOLV=/etc/resolv.conf
+DNS_STATE=""
 
-GOST2_URLS=(
-    "$SELF_CDN/gost/gost_2.11.5.gz"
-    "$SELF_RAW/gost/gost_2.11.5.gz"
-)
-GOST3_URLS=(
-    "$SELF_CDN/gost/gost_3.0.0.tar.gz"
-    "$SELF_RAW/gost/gost_3.0.0.tar.gz"
-)
-SELF_URLS=(
-    "$SELF_CDN/install.sh"
-    "$SELF_RAW/install.sh"
+# Ready-to-use fast resolvers (Iran-friendly first)
+DNS_CANDIDATES=(
+    "178.22.122.100 185.51.200.2"
+    "10.202.10.202 10.202.10.102"
+    "1.1.1.1 8.8.8.8"
+    "8.8.4.4 9.9.9.9"
+    "223.5.5.5 223.6.6.6"
 )
 
-# Download $1 -> $2. Tries wget first, then curl with an IPv4 fallback.
-smart_download() {
-    local url="$1" out="$2" deadline="${3:-180}"
-    rm -f "$out"
-    if timeout "$deadline" wget -q --tries=2 --timeout=20 --read-timeout=30 -O "$out" "$url" 2>/dev/null && [ -s "$out" ]; then
-        return 0
+dns_backup() {
+    [ -n "$DNS_STATE" ] && return 0
+    DNS_STATE=$(mktemp)
+    if [ -L "$RESOLV" ]; then
+        printf 'SYMLINK %s\n' "$(readlink "$RESOLV")" > "$DNS_STATE"
+    else
+        printf 'FILE\n' > "$DNS_STATE"
+        cat "$RESOLV" >> "$DNS_STATE" 2>/dev/null
     fi
-    rm -f "$out"
-    if curl -fsSL --ipv4 --connect-timeout 15 --max-time "$deadline" "$url" -o "$out" 2>/dev/null && [ -s "$out" ]; then
-        return 0
-    fi
-    rm -f "$out"
-    return 1
 }
 
-# Try every URL in order (last argument is the output path). Returns 0 as soon
-# as one mirror succeeds.
-smart_fetch() {
-    local out="${!#}"
-    local urls=("${@:1:$#-1}")
-    local url
-    for url in "${urls[@]}"; do
-        if smart_download "$url" "$out" 180; then
+dns_apply() {
+    local servers="$1" s
+    dns_backup
+    rm -f "$RESOLV"
+    {
+        echo "# Temporary resolv.conf set by Gost installer"
+        for s in $servers; do echo "nameserver $s"; done
+    } > "$RESOLV"
+}
+
+dns_restore() {
+    [ -z "$DNS_STATE" ] && return 0
+    [ -f "$DNS_STATE" ] || return 0
+    local first
+    first=$(head -n1 "$DNS_STATE")
+    if [ "$first" = "FILE" ]; then
+        tail -n +2 "$DNS_STATE" > "$RESOLV"
+    elif [ "${first#SYMLINK }" != "$first" ]; then
+        rm -f "$RESOLV"
+        ln -sf "${first#SYMLINK }" "$RESOLV"
+    fi
+    rm -f "$DNS_STATE"; DNS_STATE=""
+    flush_dns
+}
+
+flush_dns() {
+    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1
+    command -v systemd-resolve >/dev/null 2>&1 && systemd-resolve --flush-caches >/dev/null 2>&1
+    command -v nscd >/dev/null 2>&1 && nscd -i hosts >/dev/null 2>&1
+    return 0
+}
+
+# Download $1 -> $2. If the default DNS is too slow/fails, retry over fast DNS,
+# then always restore the original DNS on the server.
+smart_download() {
+    local url="$1" out="$2" deadline="${3:-30}" set
+    if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
+        return 0
+    fi
+    echo $'\e[33mDownload is slow/failed. Trying alternate (fast) DNS...\e[0m'
+    for set in "${DNS_CANDIDATES[@]}"; do
+        dns_apply "$set"
+        flush_dns
+        echo $'\e[36mTrying DNS: '"$set"$'\e[0m'
+        if timeout "$deadline" wget -q --tries=1 --timeout=15 -O "$out" "$url" 2>/dev/null; then
+            echo $'\e[32mDownloaded successfully.\e[0m'
+            dns_restore
             return 0
         fi
-        echo $'\e[33mMirror failed: '"$url"$'\e[0m'
     done
+    dns_restore
     return 1
 }
+
+# Always put the default DNS back on the server when we exit
+trap dns_restore EXIT
 
 # If launched via process substitution (bash <(curl ...)), install self to disk
 # so that the interactive menu can re-invoke itself reliably.
 if [ ! -f "$0" ]; then
     mkdir -p /etc/gost
-    smart_fetch "${SELF_URLS[@]}" /etc/gost/install.sh || true
+    if ! smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh" /etc/gost/install.sh 25; then
+        curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh -o /etc/gost/install.sh 2>/dev/null
+    fi
     chmod +x /etc/gost/install.sh
     exec bash /etc/gost/install.sh
 fi
@@ -196,16 +229,13 @@ install_watchdog() {
 
     cat > "$WATCHDOG_BIN" <<'WATCHEOF'
 #!/bin/bash
-# Gost auto-heal watchdog: restart the gost services when unhealthy.
-# Automatic server REBOOT is disabled by default (ALLOW_REBOOT=0): rebooting a
-# production server on a false positive is far worse than a brief outage.
+# Gost auto-heal watchdog: restart -> reboot -> give up
 STATE_DIR=/var/lib/gost-watchdog
 STATE_FILE="$STATE_DIR/state"
 LOG_FILE=/var/log/gost-watchdog.log
 MAX_RESTARTS=3
-PROBE_TIMEOUT=5
-CONFIRM=3
-ALLOW_REBOOT=0
+GRACE_AFTER_REBOOT=300
+PROBE_TIMEOUT=3
 
 mkdir -p "$STATE_DIR"
 touch "$LOG_FILE"
@@ -213,24 +243,24 @@ if [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then : > "$
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG_FILE"; }
 
-FAILS=0; RESTARTS=0
+FAILS=0; RESTARTS=0; REBOOTED=0; LAST_REBOOT=0
 [ -f "$STATE_FILE" ] && . "$STATE_FILE"
 
-save_state() { printf 'FAILS=%s\nRESTARTS=%s\n' "$FAILS" "$RESTARTS" > "$STATE_FILE"; }
-reset_state() { FAILS=0; RESTARTS=0; save_state; }
+save_state() { printf 'FAILS=%s\nRESTARTS=%s\nREBOOTED=%s\nLAST_REBOOT=%s\n' "$FAILS" "$RESTARTS" "$REBOOTED" "$LAST_REBOOT" > "$STATE_FILE"; }
+reset_state() { FAILS=0; RESTARTS=0; REBOOTED=0; LAST_REBOOT=0; save_state; }
 
-units_list() {
+services_list() {
   { ls /usr/lib/systemd/system/gost_*.service 2>/dev/null
     ls /etc/systemd/system/gost_*.service 2>/dev/null; } | grep -v 'multi-user.target' | sort -u
 }
 
-check_once() {
-  local files; files=$(units_list)
+health_ok() {
+  local files; files=$(services_list)
   [ -z "$files" ] && return 0
   local f u spec proto port
   for f in $files; do
     u=$(basename "$f")
-    systemctl is-active --quiet "$u" || { echo "unit-inactive:$u"; return 1; }
+    systemctl is-active --quiet "$u" || return 1
   done
   for f in $files; do
     while read -r spec; do
@@ -239,7 +269,6 @@ check_once() {
       case "$proto" in
         tcp|grpc)
           if ! timeout "$PROBE_TIMEOUT" bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
-            echo "port-closed:$port"
             return 1
           fi
           ;;
@@ -249,57 +278,43 @@ check_once() {
   return 0
 }
 
-# Require several consecutive failed probes before acting, so temporary load or
-# a slow first packet does not trigger a needless restart.
-health_ok() {
-  local i
-  for i in $(seq 1 "$CONFIRM"); do
-    check_once >/dev/null || return 1
-    sleep 1
-  done
-  return 0
-}
-
-reason=$(check_once) || true
-
 if health_ok; then
-  if [ "$FAILS" != "0" ] || [ "$RESTARTS" != "0" ]; then
+  if [ "$REBOOTED" = "1" ] || [ "$FAILS" != "0" ] || [ "$RESTARTS" != "0" ]; then
     log "healthy; resetting state"
     reset_state
   fi
   exit 0
 fi
 
+now=$(date +%s)
 FAILS=$((FAILS+1))
 
-# Already gave up for this failure episode -> stay quiet until it recovers.
-if [ "$RESTARTS" = "-1" ]; then
+# Already rebooted once for this failure -> do nothing more
+if [ "$REBOOTED" = "1" ]; then
+  if [ $(( now - LAST_REBOOT )) -lt "$GRACE_AFTER_REBOOT" ]; then
+    log "unhealthy (fails=$FAILS) but inside post-reboot grace window; waiting"
+    save_state; exit 0
+  fi
+  log "still unhealthy after reboot; giving up (problem likely elsewhere). No further action."
   save_state; exit 0
 fi
 
-# Stage 1: restart the tunnel (up to MAX_RESTARTS times per episode).
+# Stage 1: restart the tunnel
 if [ "$RESTARTS" -lt "$MAX_RESTARTS" ]; then
-  log "unhealthy (${reason:-unknown}, fails=$FAILS); restarting gost services (attempt $((RESTARTS+1))/$MAX_RESTARTS)"
+  log "unhealthy (fails=$FAILS); restarting gost services (attempt $((RESTARTS+1))/$MAX_RESTARTS)"
   systemctl daemon-reload
-  while read -r f; do
-    [ -n "$f" ] && systemctl restart "$(basename "$f")" 2>/dev/null
-  done < <(units_list)
+  systemctl restart gost_*.service 2>/dev/null
   RESTARTS=$((RESTARTS+1)); save_state
   sleep 10
   if health_ok; then log "recovered after restart"; reset_state; exit 0; fi
   exit 0
 fi
 
-# Stage 2: restarts exhausted.
-if [ "$ALLOW_REBOOT" = "1" ]; then
-  log "restart attempts exhausted; rebooting server once (ALLOW_REBOOT=1)"
-  FAILS=0; RESTARTS=0; save_state
-  sync
-  systemctl reboot
-else
-  log "restart attempts exhausted (fails=$FAILS); ALLOW_REBOOT=0 so no reboot. Manual attention needed."
-  RESTARTS=-1; save_state
-fi
+# Stage 2: restarts exhausted -> reboot once
+log "restart attempts exhausted; rebooting server once"
+REBOOTED=1; RESTARTS=0; FAILS=0; LAST_REBOOT=$now; save_state
+sync
+systemctl reboot
 WATCHEOF
 
     chmod +x "$WATCHDOG_BIN"
@@ -383,11 +398,6 @@ read -p $'\e[97mYour choice: \e[0m' choice
 
 # If option 1 or 2 is selected
 if [ "$choice" -eq 1 ] || [ "$choice" -eq 2 ]; then
-    if ls /usr/lib/systemd/system/gost_*.service >/dev/null 2>&1; then
-        echo $'\e[33mGost is already installed. Re-applying with the new settings...\e[0m'
-    else
-        echo $'\e[32mFresh install: configuring Gost for the first time...\e[0m'
-    fi
     if [ "$choice" -eq 1 ]; then
         read -p $'\e[97mPlease enter the destination (Kharej) IPv4: \e[0m' destination_ip
     elif [ "$choice" -eq 2 ]; then
@@ -455,7 +465,7 @@ systemctl enable sysctl-custom
     echo $'\e[32mSystem update completed.\e[0m'
 
     echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-    if smart_fetch "${GOST2_URLS[@]}" /tmp/gost-2.11.5.gz; then
+    if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
         gunzip -f /tmp/gost-2.11.5.gz
         mv /tmp/gost-2.11.5 /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
@@ -487,25 +497,13 @@ systemctl enable sysctl-custom
     done
 
     echo $'\e[32mGost configuration applied successfully.\e[0m'
-    echo $'\e[36mActive forwarding rules:\e[0m'
-    for service_file in /usr/lib/systemd/system/gost_*.service; do
-        [ -f "$service_file" ] || continue
-        u=$(basename "$service_file")
-        state=$(systemctl is-active "$u" 2>/dev/null)
-        exec_line=$(grep -m1 '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
-        echo "  - $u [$state]: $exec_line"
-    done
 
     # --- Automatic optimizations on install ---
     echo $'\e[32mRunning automatic optimizations...\e[0m'
     apply_optimizations
     install_watchdog
 
-    echo $'\e[32m=================================================\e[0m'
-    echo $'\e[32mInstallation complete. Gost tunnel is up.\e[0m'
-    echo $'\e[32mDestination: '"$destination_ip"$'   Ports: '"$ports"$'   Protocol: '"$protocol"$'\e[0m'
-    echo $'\e[32mAuto-heal watchdog enabled (restart-only, no reboot).\e[0m'
-    echo $'\e[32m=================================================\e[0m'
+    echo $'\e[32mAll done. Tunnel is up with auto-heal enabled.\e[0m'
 
     bash "$0"
 
@@ -539,7 +537,7 @@ elif [ "$choice" -eq 4 ]; then
     if [ "$update_choice" == "y" ]; then
         echo $'\e[32mUpdating Gost script, please wait...\e[0m'
         mkdir -p /etc/gost
-        smart_fetch "${SELF_URLS[@]}" /etc/gost/install.sh
+        smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/install.sh" /etc/gost/install.sh 25
         chmod +x /etc/gost/install.sh
         echo $'\e[32mUpdate completed.\e[0m'
     else
@@ -584,15 +582,7 @@ elif [ "$choice" -eq 5 ]; then
     systemctl daemon-reload
     systemctl enable "gost_$destination_ip.service" >/dev/null 2>&1
     systemctl restart "gost_$destination_ip.service"
-    echo $'\e[32mDone. Destination '"$destination_ip"$' added on port(s) '"$port"$' ('"$protocol"$').\e[0m'
-    echo $'\e[36mActive forwarding rules:\e[0m'
-    for service_file in /usr/lib/systemd/system/gost_*.service; do
-        [ -f "$service_file" ] || continue
-        u=$(basename "$service_file")
-        state=$(systemctl is-active "$u" 2>/dev/null)
-        exec_line=$(grep -m1 '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
-        echo "  - $u [$state]: $exec_line"
-    done
+    echo $'\e[32mGost configuration applied successfully.\e[0m'
     bash "$0"
 
 # If option 6 is selected
@@ -606,7 +596,7 @@ elif [ "$choice" -eq 6 ]; then
     case "$gost_version_choice" in
         1)
             echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-            if smart_fetch "${GOST2_URLS[@]}" /tmp/gost-2.11.5.gz; then
+            if smart_download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
                 gunzip -f /tmp/gost-2.11.5.gz
                 mv /tmp/gost-2.11.5 /usr/local/bin/gost
                 chmod +x /usr/local/bin/gost
@@ -617,8 +607,9 @@ elif [ "$choice" -eq 6 ]; then
             fi
             ;;
         2)
-            echo $'\e[32mInstalling Gost version 3.x, please wait...\e[0m'
-            if smart_fetch "${GOST3_URLS[@]}" /tmp/gost.tar.gz; then
+            echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
+            download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@main/gost/gost_3.0.0.tar.gz"
+            if smart_download "$download_url" /tmp/gost.tar.gz 40; then
                 tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
                 chmod +x /usr/local/bin/gost && \
                 echo $'\e[32mGost 3.x installed successfully.\e[0m'
@@ -697,7 +688,7 @@ elif [ "$choice" -eq 8 ]; then
 # If option 9 is selected
 elif [ "$choice" -eq 9 ]; then
     echo $'\e[32mInstalling BBR, please wait...\e[0m'
-    if smart_download "https://github.com/teddysun/across/raw/master/bbr.sh" /tmp/bbr.sh 120; then
+    if smart_download "https://cdn.jsdelivr.net/gh/teddysun/across@master/bbr.sh" /tmp/bbr.sh 30; then
         chmod +x /tmp/bbr.sh
         bash /tmp/bbr.sh
     else
