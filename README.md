@@ -5,7 +5,7 @@
 [English](README.md) | [فارسی](README-Fa.md)
 
 An interactive Bash installer/manager for **Gost** tunnels (IPv4 / IPv6), with automatic
-server optimization and a self-healing watchdog.
+server optimization and fast (jsDelivr CDN) downloads.
 
 </div>
 
@@ -16,7 +16,7 @@ server optimization and a self-healing watchdog.
 Run as **root** on your server:
 
 ```bash
-bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.0/install.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/install.sh)
 ```
 
 The script self-installs to `/etc/gost/install.sh`, so afterwards you can just type:
@@ -43,7 +43,7 @@ killing the tunnel under load. `vm.swappiness` is set to `10` (safety net, not a
 
 ### 2. Kernel / network tuning
 Written to `/etc/sysctl.d/99-gost-tuning.conf` and applied persistently:
-- `nf_conntrack_max = 262144` and shorter established timeout
+- `nf_conntrack_max = 262144`
 - `somaxconn`, `tcp_max_syn_backlog`, `netdev_max_backlog`
 - `tcp_tw_reuse`, `tcp_fin_timeout`, `tcp_slow_start_after_idle`
 - larger `rmem`/`wmem` buffers, higher `fs.file-max`, `swappiness=10`
@@ -66,24 +66,12 @@ After=network-online.target
 So if gost crashes or is OOM-killed it comes back automatically, and it is
 protected from being chosen by the OOM-killer.
 
-### 5. Auto-Heal Watchdog
-A systemd timer runs a health check every 60 seconds and escalates:
-1. **Restart** the tunnel (up to 3 attempts).
-2. Still down? **Reboot the server once**.
-3. Still down after the reboot? **Do nothing further** (the problem is probably
-   elsewhere — no reboot loop).
+### 5. Fast downloads (jsDelivr CDN)
+Gost binaries and the script itself are downloaded from the jsDelivr CDN instead
+of GitHub, which is much faster/reliable from Iran. Plain `wget` with a `curl`
+fallback — no changes are made to the server's DNS settings.
 
-State is persisted, so it never reboots more than once per failure, and it resets
-automatically once the tunnel is healthy again. Health = all units active + a TCP
-probe to the listening port.
-
-### 6. Fast-DNS assisted download
-Downloading from GitHub on an Iranian server is often slow. Every GitHub download
-now: tries the default DNS first, and if it is too slow/fails, automatically
-switches through a list of fast resolvers (Shecan, Radar, Cloudflare/Google,
-Quad9, AliDNS), then **always restores the server's original DNS** afterwards.
-
-### 7. No version prompt
+### 6. No version prompt
 The tunnel install always uses the **official Gost 2.11.5** — it no longer asks
 "official or latest".
 
@@ -104,12 +92,10 @@ The tunnel install always uses the **official Gost 2.11.5** — it no longer ask
 | 9 | Install BBR |
 | 10 | Uninstall |
 | 11 | Apply Optimizations (Swap + Tuning) |
-| 12 | Install Auto-Heal Watchdog |
-| 13 | Remove Auto-Heal Watchdog |
-| 14 | Exit |
+| 12 | Exit |
 
-When you install a tunnel (options 1 or 2), the optimizations and the watchdog are
-installed automatically.
+When you install a tunnel (options 1 or 2), the optimizations are applied
+automatically.
 
 ---
 
@@ -130,4 +116,4 @@ Original repository: https://github.com/masoudgb/Gost-ip6
 
 ## Version
 
-`v2.3.0-opt`
+`v2.3.1-opt`
