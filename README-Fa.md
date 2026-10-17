@@ -16,7 +16,7 @@
 روی سرور و با دسترسی **root** اجرا کنید:
 
 ```bash
-bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/install.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/install.sh)
 ```
 
 اسکریپت خودش را در `/etc/gost/install.sh` نصب می‌کند، بنابراین بعد از آن فقط با تایپ:
@@ -117,4 +117,4 @@ OOM-killer محافظت می‌شود.
 
 ## نسخه
 
-`v2.3.1-opt`
+`v2.3.2-opt`

@@ -23,11 +23,24 @@ download() {
 # so that the interactive menu can re-invoke itself reliably.
 if [ ! -f "$0" ]; then
     mkdir -p /etc/gost
-    if ! download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/install.sh" /etc/gost/install.sh 25; then
-        curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/install.sh -o /etc/gost/install.sh 2>/dev/null
+    if ! download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/install.sh" /etc/gost/install.sh 25; then
+        curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/install.sh -o /etc/gost/install.sh 2>/dev/null
     fi
     chmod +x /etc/gost/install.sh
     exec bash /etc/gost/install.sh
+fi
+
+# Safety cleanup: remove the legacy Auto-Heal watchdog if a previous version
+# installed it (it could restart the tunnel or reboot the server).
+if [ -e /etc/systemd/system/gost-watchdog.timer ] || [ -e /usr/local/bin/gost-watchdog.sh ]; then
+    echo $'\e[33mRemoving legacy Auto-Heal watchdog...\e[0m'
+    systemctl disable --now gost-watchdog.timer >/dev/null 2>&1
+    rm -f /usr/local/bin/gost-watchdog.sh \
+          /etc/systemd/system/gost-watchdog.service \
+          /etc/systemd/system/gost-watchdog.timer
+    rm -rf /var/lib/gost-watchdog
+    systemctl daemon-reload >/dev/null 2>&1
+    echo $'\e[32mLegacy watchdog removed.\e[0m'
 fi
 
 #####################################################################
@@ -166,7 +179,7 @@ echo $'\e[35m'"  ___|              |        _ _|  _ \   /
 
 echo -e "\e[36mCreated By Masoud Gb Special Thanks Hamid Router\e[0m"
 echo -e "\e[36mOptimized Fork by Aknuun (Auto Swap + Tuning)\e[0m"
-echo $'\e[35m'"Gost Ip6 Script v2.3.1-opt"$'\e[0m'
+echo $'\e[35m'"Gost Ip6 Script v2.3.2-opt"$'\e[0m'
 
 options=($'\e[36m1. \e[0mGost Tunnel By IP4'
          $'\e[36m2. \e[0mGost Tunnel By IP6'
@@ -255,7 +268,7 @@ systemctl enable sysctl-custom
     echo $'\e[32mSystem update completed.\e[0m'
 
     echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-    if download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+    if download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
         gunzip -f /tmp/gost-2.11.5.gz
         mv /tmp/gost-2.11.5 /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
@@ -326,7 +339,7 @@ elif [ "$choice" -eq 4 ]; then
     if [ "$update_choice" == "y" ]; then
         echo $'\e[32mUpdating Gost script, please wait...\e[0m'
         mkdir -p /etc/gost
-        download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/install.sh" /etc/gost/install.sh 25
+        download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/install.sh" /etc/gost/install.sh 25
         chmod +x /etc/gost/install.sh
         echo $'\e[32mUpdate completed.\e[0m'
     else
@@ -385,7 +398,7 @@ elif [ "$choice" -eq 6 ]; then
     case "$gost_version_choice" in
         1)
             echo $'\e[32mInstalling Gost version 2.11.5 (official), please wait...\e[0m'
-            if download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
+            if download "https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/gost/gost_2.11.5.gz" /tmp/gost-2.11.5.gz 30; then
                 gunzip -f /tmp/gost-2.11.5.gz
                 mv /tmp/gost-2.11.5 /usr/local/bin/gost
                 chmod +x /usr/local/bin/gost
@@ -397,7 +410,7 @@ elif [ "$choice" -eq 6 ]; then
             ;;
         2)
             echo $'\e[32mInstalling the latest Gost version 3.x, please wait...\e[0m'
-            download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/gost/gost_3.0.0.tar.gz"
+            download_url="https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/gost/gost_3.0.0.tar.gz"
             if download "$download_url" /tmp/gost.tar.gz 40; then
                 tar -xvzf /tmp/gost.tar.gz -C /usr/local/bin/ && \
                 chmod +x /usr/local/bin/gost && \

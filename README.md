@@ -16,7 +16,7 @@ server optimization and fast (jsDelivr CDN) downloads.
 Run as **root** on your server:
 
 ```bash
-bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.1/install.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/Aknuun/Gost-ip6@v2.3.2/install.sh)
 ```
 
 The script self-installs to `/etc/gost/install.sh`, so afterwards you can just type:
@@ -116,4 +116,4 @@ Original repository: https://github.com/masoudgb/Gost-ip6
 
 ## Version
 
-`v2.3.1-opt`
+`v2.3.2-opt`
